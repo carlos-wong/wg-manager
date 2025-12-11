@@ -22,15 +22,30 @@ cd wg-manager
 # 使用 uv 安装依赖
 uv sync
 
-# 或者使用 pip
+# 激活虚拟环境（之后可直接使用 wg-manager 命令）
+source .venv/bin/activate
+
+# 或者不激活环境，使用 uv run 前缀运行
+wg-manager
+```
+
+**其他安装方式：**
+
+```bash
+# 使用 pip 安装（全局或虚拟环境）
 pip install -e .
+
+# 之后可直接使用
+wg-manager
 ```
 
 ### 依赖
 
 - Python 3.10+
-- qrcode (Python 库，已包含在依赖中，`uv sync` 自动安装)
+- qrcode (Python 库，已包含在依赖中，自动安装)
 - 系统 `ssh` 和 `scp` 命令 (用于远程管理)
+
+> **提示**: 以下文档中的命令均使用 `wg-manager`。如果未激活虚拟环境，请在命令前加上 `uv run`，如 `wg-manager list`。
 
 ## 快速入门
 
@@ -41,14 +56,14 @@ pip install -e .
 ```bash
 # 第 1 步：初始化服务端（在本地执行）
 # 将 1.2.3.4 替换为你的服务器公网 IP
-uv run wg-manager init -e 1.2.3.4
+wg-manager init -e 1.2.3.4
 
 # 输出:
 # 服务端初始化成功!
 # 公钥: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # 第 2 步：添加客户端（会自动显示配置）
-uv run wg-manager add -n my-phone
+wg-manager add -n my-phone
 
 # 输出:
 # 客户端 'my-phone' 添加成功!
@@ -61,10 +76,10 @@ uv run wg-manager add -n my-phone
 # ...（完整配置）
 
 # 第 3 步：显示二维码，用手机 WireGuard App 扫码
-uv run wg-manager export -n my-phone --qr
+wg-manager export -n my-phone --qr
 
 # 第 4 步：导出服务端配置
-uv run wg-manager server
+wg-manager server
 
 # 第 5 步：将服务端配置部署到服务器
 # 方法 A：手动复制（显示的配置内容复制到服务器 /etc/wireguard/wg0.conf）
@@ -86,12 +101,12 @@ sudo systemctl start wg-quick@wg0
 
 ```bash
 # 第 1 步：配置 SSH 连接
-uv run wg-manager ssh --host 1.2.3.4
+wg-manager ssh --host 1.2.3.4
 
 # 输出: SSH 连接配置成功!
 
 # 第 2 步：从远程服务器导入配置
-uv run wg-manager import --remote -e 1.2.3.4
+wg-manager import --remote -e 1.2.3.4
 
 # 输出:
 # 服务端导入成功!
@@ -100,7 +115,7 @@ uv run wg-manager import --remote -e 1.2.3.4
 # 是否导入这些客户端? (y/n)
 
 # 第 3 步：添加新客户端（自动同步到服务器，无需手动操作）
-uv run wg-manager add -n new-laptop
+wg-manager add -n new-laptop
 
 # 输出:
 # 客户端 'new-laptop' 添加成功!
@@ -109,7 +124,7 @@ uv run wg-manager add -n new-laptop
 # （配置已自动同步到远程服务器）
 
 # 第 4 步：查看远程服务器状态
-uv run wg-manager remote-status
+wg-manager remote-status
 ```
 
 ### 场景三：使用交互式菜单
@@ -117,7 +132,7 @@ uv run wg-manager remote-status
 适用于：不想记命令，喜欢菜单操作的用户。
 
 ```bash
-uv run wg-manager
+wg-manager
 ```
 
 ```
