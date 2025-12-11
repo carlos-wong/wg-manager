@@ -29,7 +29,7 @@ pip install -e .
 ### 依赖
 
 - Python 3.10+
-- qrencode (用于生成二维码，可选): `brew install qrencode` 或 `apt install qrencode`
+- qrcode (Python 库，已包含在依赖中，`uv sync` 自动安装)
 - 系统 `ssh` 和 `scp` 命令 (用于远程管理)
 
 ## 快速入门

@@ -516,19 +516,19 @@ AllowedIPs = {peer.address.split('/')[0]}/32
         return filepath
 
     def export_client_qrcode(self, name: str) -> bool:
-        """生成客户端配置二维码"""
+        """生成客户端配置二维码（终端显示）"""
         try:
+            import qrcode
             config = self.get_client_config(name)
-            subprocess.run(
-                ["qrencode", "-t", "ansiutf8"],
-                input=config,
-                text=True,
-                check=True
+            qr = qrcode.QRCode(
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=1,
+                border=1,
             )
+            qr.add_data(config)
+            qr.make(fit=True)
+            qr.print_ascii(invert=True)
             return True
-        except FileNotFoundError:
-            print("提示: 安装 qrencode 可显示二维码 (brew install qrencode / apt install qrencode)")
-            return False
         except Exception as e:
             print(f"生成二维码失败: {e}")
             return False
