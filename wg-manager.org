@@ -16,3 +16,9 @@ Deleted: None
 Files: reports/2026/01/10-client-sync-mechanism.md
 Notes: 研究完成 - 当前项目添加客户端时只依赖本地数据库分配IP，不会先从服务器同步，存在潜在的数据不一致风险
 
+*** PLAN 在添加节点之前，从服务器拉取配置再添加新节点，防止有两边同时添加多个节点到服务器上导致 IP 冲突的问题。 
+:PROPERTIES:
+:CREATED:  [2026-01-10 Sat 13:48]
+:ID:       17F309BE-733A-4AFB-88A3-2EF5A4984F6C
+:END:
+
