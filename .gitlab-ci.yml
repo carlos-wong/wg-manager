@@ -1038,10 +1038,35 @@ execute_worflow_ai_agent:
         # Call emacs function to complete org task and commit to complete branch
         AGENT_REPORT_CONTENT=$(cat "$AGENT_REPORT")
         if [ "$AGENT_COMMAND" = "cc_plan" ]; then
-          PLAN_JSON_PATH=$(grep -m1 '^Files:' "$AGENT_REPORT" | sed -E 's/^Files:[[:space:]]*//' | awk -F',' '{print $1}' | xargs)
+          # Priority 1: Check for cc_plan_output.json in repo root (per cc_plan command spec)
+          PLAN_JSON_PATH=""
+          if [ -f "$REPO_PATH/cc_plan_output.json" ]; then
+            PLAN_JSON_PATH="$REPO_PATH/cc_plan_output.json"
+            echo "Found cc_plan_output.json in repo root"
+          fi
+          # Priority 2: Extract from agent_report Files: line (must be .json file)
+          if [ -z "$PLAN_JSON_PATH" ]; then
+            EXTRACTED_PATH=$(grep -m1 '^Files:' "$AGENT_REPORT" | sed -E 's/^Files:[[:space:]]*//' | awk -F',' '{print $1}' | xargs)
+            if [ -n "$EXTRACTED_PATH" ] && echo "$EXTRACTED_PATH" | grep -qE '\.json$'; then
+              if [ -f "$EXTRACTED_PATH" ]; then
+                PLAN_JSON_PATH="$EXTRACTED_PATH"
+                echo "Found JSON from agent_report Files: $PLAN_JSON_PATH"
+              elif [ -f "$REPO_PATH/$EXTRACTED_PATH" ]; then
+                PLAN_JSON_PATH="$REPO_PATH/$EXTRACTED_PATH"
+                echo "Found JSON from agent_report Files (relative): $PLAN_JSON_PATH"
+              fi
+            elif [ -n "$EXTRACTED_PATH" ]; then
+              echo "Skipping non-JSON file from agent_report: $EXTRACTED_PATH"
+            fi
+          fi
+          # Priority 3: Check .carlos/.codex/plan_exports directory
           if [ -z "$PLAN_JSON_PATH" ] && [ -d "$REPO_PATH/.carlos/.codex/plan_exports" ]; then
             PLAN_JSON_PATH=$(find "$REPO_PATH/.carlos/.codex/plan_exports" -type f -name '*.json' -print0 | xargs -0 ls -t 2>/dev/null | head -n 1)
+            if [ -n "$PLAN_JSON_PATH" ]; then
+              echo "Found JSON from .carlos/.codex/plan_exports: $PLAN_JSON_PATH"
+            fi
           fi
+          # Call emacs only if we have a valid JSON file
           if [ -n "$PLAN_JSON_PATH" ] && [ -f "$PLAN_JSON_PATH" ]; then
             echo "Calling emacs to insert plan JSON: $PLAN_JSON_PATH"
             PLAN_JSON_PATH_B64=$(printf '%s' "$PLAN_JSON_PATH" | base64 -w 0)
@@ -1052,7 +1077,7 @@ execute_worflow_ai_agent:
               echo "emacs agent-insert-plan-json-to-org failed"
             fi
           else
-            echo "Plan JSON not found; expected in agent_report or .carlos/.codex/plan_exports"
+            echo "Plan JSON not found; checked: cc_plan_output.json, agent_report Files:, .carlos/.codex/plan_exports"
           fi
         fi
         echo "Calling emacs to complete org task and commit..."
