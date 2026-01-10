@@ -4,9 +4,15 @@
 :ID:       132759CC-B110-4865-A367-8F5D17EFFA63
 :END:
 
-** RESEARCH 查看一下当前项目里面添加客户端节点的时候，有没有先跟服务器进行一次同步，还是只依赖本地的数据库？ 
+** PENDING 查看一下当前项目里面添加客户端节点的时候，有没有先跟服务器进行一次同步，还是只依赖本地的数据库？ 
 :PROPERTIES:
 :CREATED:  [2026-01-10 Sat 12:28]
 :ID:       884058B2-1499-40DE-A263-678D07AA843E
 :END:
+- Note taken on [2026-01-10 Sat 12:32] (pipeline: 370328) \\
+  Added: reports/2026/01/10-client-sync-mechanism.md:1
+Modified: None
+Deleted: None
+Files: reports/2026/01/10-client-sync-mechanism.md
+Notes: 研究完成 - 当前项目添加客户端时只依赖本地数据库分配IP，不会先从服务器同步，存在潜在的数据不一致风险
 
