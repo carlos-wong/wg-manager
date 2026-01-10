@@ -1,5 +1,0 @@
-Added: reports/2026/01/10-client-sync-mechanism.md:1
-Modified: None
-Deleted: None
-Files: reports/2026/01/10-client-sync-mechanism.md
-Notes: 研究完成 - 当前项目添加客户端时只依赖本地数据库分配IP，不会先从服务器同步，存在潜在的数据不一致风险
