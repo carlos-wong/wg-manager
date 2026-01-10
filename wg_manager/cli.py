@@ -380,6 +380,92 @@ def _menu_show_qrcode(manager: WireGuardManager):
     manager.export_client_qrcode(name)
 
 
+def _prompt_import_remote_configs(manager: WireGuardManager, host: str):
+    """SSH 连接成功后，询问用户是否要导入远程配置"""
+    ssh_client = manager.get_ssh_client()
+    if not ssh_client:
+        return
+
+    # 扫描远程配置文件
+    print("\n正在扫描远程服务器上的 WireGuard 配置...")
+    success, interfaces = ssh_client.scan_wireguard_configs()
+
+    if not success or not interfaces:
+        print("  未发现 WireGuard 配置文件")
+        return
+
+    print(f"  发现 {len(interfaces)} 个配置: {', '.join(interfaces)}")
+
+    # 检查哪些已经导入过
+    existing_servers = manager.get_servers()
+    existing_interfaces = set()
+    for s in existing_servers:
+        if s.endpoint == host:
+            existing_interfaces.add(s.interface)
+
+    new_interfaces = [i for i in interfaces if i not in existing_interfaces]
+
+    if not new_interfaces:
+        print("  所有配置已导入，无需重复导入")
+        return
+
+    if existing_interfaces:
+        print(f"  已导入: {', '.join(existing_interfaces)}")
+        print(f"  待导入: {', '.join(new_interfaces)}")
+
+    # 询问用户
+    try:
+        choice = input(f"\n是否导入这些配置? (y/n) [y]: ").strip().lower()
+        if choice == 'n':
+            print("已跳过导入")
+            return
+    except KeyboardInterrupt:
+        print("\n已跳过导入")
+        return
+
+    # 逐个导入
+    for interface in new_interfaces:
+        try:
+            print(f"\n正在导入 {interface}...")
+            # 临时设置接口以读取配置
+            from .ssh import RemoteWireGuard
+            remote_wg = RemoteWireGuard(ssh_client, interface)
+            success, content = remote_wg.get_config()
+
+            if not success:
+                print(f"  ✗ 读取 {interface} 配置失败: {content}")
+                continue
+
+            # 导入配置
+            server, existing_peers = manager._parse_and_import_config(content, host, interface)
+            print(f"  ✓ {interface} 导入成功 ({server.address}, 端口 {server.listen_port})")
+
+            # 处理已有客户端
+            if existing_peers:
+                print(f"    发现 {len(existing_peers)} 个已有客户端")
+                try:
+                    import_choice = input(f"    是否导入这些客户端? (y/n) [n]: ").strip().lower()
+                    if import_choice == 'y':
+                        for p in existing_peers:
+                            try:
+                                manager.import_existing_peer(
+                                    name=p['name'],
+                                    public_key=p['public_key'],
+                                    address=p['allowed_ips'],
+                                    preshared_key=p.get('preshared_key', '')
+                                )
+                                print(f"      ✓ 导入 {p['name']}")
+                            except Exception as e:
+                                print(f"      ✗ 导入 {p['name']} 失败: {e}")
+                except KeyboardInterrupt:
+                    print("\n    跳过客户端导入")
+
+        except Exception as e:
+            print(f"  ✗ 导入 {interface} 失败: {e}")
+
+    print("\n导入完成!")
+
+
 def _menu_setup_ssh(manager: WireGuardManager):
     print("\n--- 配置 SSH 连接 --- (Ctrl+C 返回菜单)")
     host = get_input_required("服务器地址")
@@ -390,6 +476,8 @@ def _menu_setup_ssh(manager: WireGuardManager):
     success, msg = manager.setup_ssh(host, int(port), user)
     if success:
         print(f"✓ SSH 连接成功!")
+        # 询问是否导入远程配置
+        _prompt_import_remote_configs(manager, host)
     else:
         print(f"✗ SSH 连接失败: {msg}")
 
@@ -674,6 +762,17 @@ def main():
                 sys.exit(1)
 
         elif args.command == "add":
+            # 多服务端时必须显式指定 -s 参数
+            servers = manager.get_servers()
+            if len(servers) > 1 and not (hasattr(args, 'server') and args.server):
+                print("错误: 存在多个服务端，请使用 -s 参数指定目标服务端", file=sys.stderr)
+                print("\n可用服务端:", file=sys.stderr)
+                for s in servers:
+                    peer_count = len(manager.db.get_peers(s.id))
+                    print(f"  -s {s.endpoint}:{s.interface}  ({s.address}, {peer_count} 客户端)", file=sys.stderr)
+                print(f"\n示例: wg-manager -s {servers[0].endpoint}:{servers[0].interface} add -n {args.name}", file=sys.stderr)
+                sys.exit(1)
+
             peer = manager.add_peer(args.name, args.dns, args.mtu,
                                     sync_remote=not args.no_sync)
             print(f"客户端 '{args.name}' 添加成功!")
@@ -737,6 +836,8 @@ def main():
             success, msg = manager.setup_ssh(args.host, args.port, args.user)
             if success:
                 print(f"SSH 连接配置成功!")
+                # 询问是否导入远程配置
+                _prompt_import_remote_configs(manager, args.host)
             else:
                 print(f"SSH 连接失败: {msg}", file=sys.stderr)
                 sys.exit(1)

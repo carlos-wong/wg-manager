@@ -127,6 +127,22 @@ class SSHClient:
         """读取远程文件内容"""
         return self.run_command(f"cat {remote_path}")
 
+    def scan_wireguard_configs(self, wg_dir: str = "/etc/wireguard") -> tuple[bool, list[str]]:
+        """扫描远程服务器上的 WireGuard 配置文件，返回接口名列表"""
+        success, output = self.run_command(f"ls -1 {wg_dir}/*.conf 2>/dev/null")
+        if not success or not output.strip():
+            return False, []
+
+        interfaces = []
+        for line in output.strip().split('\n'):
+            if line.endswith('.conf'):
+                # 从 /etc/wireguard/wg0.conf 提取 wg0
+                import os
+                interface = os.path.basename(line).replace('.conf', '')
+                interfaces.append(interface)
+
+        return True, interfaces
+
     def write_remote_file(self, remote_path: str, content: str) -> tuple[bool, str]:
         """写入远程文件（通过 stdin）"""
         try:
