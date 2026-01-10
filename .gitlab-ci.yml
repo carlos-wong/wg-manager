@@ -1,0 +1,1896 @@
+# GitLab CI/CD configuration for Code Agent
+# Based on .gitea/workflows/code_agent.yml mechanism
+# Note: No git worktree needed in GitLab CI (repository is cloned fresh)
+# Note: Branch filtering rules are applied per-job instead of using workflow:rules
+stages:
+  - schedule_check
+  - sync
+  - only_code_agent
+  - find_task_for_agent
+  - agent_workflow_excute
+  - sync_agent_result
+  - auto_merge
+  - cleanup
+before_script:
+  - |
+      if [ -f /home/gitlab-runner/.bash_env ]; then
+        echo "Loading environment variables from /home/gitlab-runner/.bash_env"
+        source /home/gitlab-runner/.bash_env
+      else
+        echo "Warning: /home/gitlab-runner/.bash_env not found"
+      fi
+variables:
+  GIT_DEPTH: 0
+  # Branch status names
+  SHA_SHORT: $CI_COMMIT_SHORT_SHA
+  CODING_BRANCH_PREFIX: "coding/gitlab-ci"
+  COMPLETE_BRANCH_PREFIX: "complete/gitlab-ci"
+  FAIL_BRANCH_PREFIX: "fail/gitlab-ci"
+  # Environment file for sharing variables between jobs
+  ENV_FILE: "/tmp/ci_runners_gitlab/.env_gitlab_${CI_PIPELINE_ID}"
+  ENV_FILE_DIR: "/tmp/ci_runners_gitlab"
+  PATH: "/home/gitlab-runner/.npm-global/bin:/home/gitlab-runner/.local/bin:/home/gitlab-runner/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
+  # Codex model versions (centralized for easy updates)
+  CODEX_SEARCH_MODEL: "gpt-5.2"
+  CODEX_RUNNER_MODEL: "gpt-5.2-codex"
+  # Toggle PushDeer notify when complete branch is pushed (true/false)
+  PUSHDEER_NOTIFY_COMPLETE_BRANCH: "false"
+  NOTIFY_MERGED_BRANCH_CLEANUP: false
+  # Toggle PushDeer notify when task starts (true/false)
+  NOTIFY_TASK_START: "false"
+  CARLOS_AUTO_MERGE_DEBUG: "false"
+  # Toggle PushDeer notifications for auto-merge events (true/false)
+  NOTIFY_AUTO_MERGE_START: "false"
+  NOTIFY_AUTO_MERGE_CONFLICT: "false"
+  NOTIFY_AUTO_MERGE_SUCCESS: "false"
+
+
+# Main job to execute the code agent
+use_agent_to_code:
+  stage: only_code_agent
+  timeout: 30m
+  retry: 2
+  tags:
+    - linux
+  rules:
+# 增加一个规则，过滤掉 ai_flow/ 开头的分支 todo
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH =~ /^carlos\/ai\/.*/
+    - if: $CI_COMMIT_BRANCH =~ /^ai\/.*/
+  before_script:
+    - |
+      # Load environment variables from /home/gitlab-runner/.bash_env
+      if [ -f /home/gitlab-runner/.bash_env ]; then
+        echo "Loading environment variables from /home/gitlab-runner/.bash_env"
+        source /home/gitlab-runner/.bash_env
+      else
+        echo "Warning: /home/gitlab-runner/.bash_env not found"
+      fi
+    - echo "Setting up environment..."
+    - mkdir -p "$ENV_FILE_DIR"
+    - |
+      # Configure git user identity for the code agent
+      git config user.name "carlos_code_agent"
+      git config user.email "huaixian.huang+codeagent@gmail.com"
+      echo "Git user identity configured for code agent"
+    # Note: origin_gitea setup moved to sync_completion_to_gitea job
+    - |
+      # Check if origin_ssh remote exists, if not create it from HTTP URL
+      ORIGIN_URL=$(git remote get-url origin)
+
+      # Transform HTTP URL to SSH URL
+      # http://popos.codecola.uk:10081/path -> ssh://git@popos.codecola.uk:10022/path
+      SSH_URL="ssh://git@${CI_SERVER_HOST}:10022/${CI_PROJECT_PATH}.git"
+      echo "Dump created ssh_url is: $SSH_URL"
+      if ! git remote get-url origin_ssh &>/dev/null; then
+        echo "origin_ssh remote not found, creating from origin URL..."
+        echo "Current origin URL: $ORIGIN_URL"
+
+        # Construct SSH URL using GitLab CI environment variables
+        # CI_SERVER_HOST provides the hostname, CI_PROJECT_PATH provides namespace/project
+        SSH_URL="ssh://git@${CI_SERVER_HOST}:10022/${CI_PROJECT_PATH}.git"
+        if [ "$SSH_URL" = "$ORIGIN_URL" ]; then
+          echo "Warning: URL transformation did not match expected pattern, using origin as fallback"
+          SSH_URL="$ORIGIN_URL"
+        fi
+
+        echo "Adding origin_ssh remote with URL: $SSH_URL"
+        git remote add origin_ssh "$SSH_URL"
+
+        # Fetch from origin_ssh to ensure it's working
+        echo "Fetching from origin_ssh..."
+        git fetch origin_ssh || echo "Warning: Failed to fetch from origin_ssh, push operations may fail"
+      else
+        # Check if existing URL matches expected
+        EXISTING_SSH_URL=$(git remote get-url origin_ssh)
+        if [ "$EXISTING_SSH_URL" != "$SSH_URL" ]; then
+          echo "origin_ssh URL mismatch. Expected: $SSH_URL, Got: $EXISTING_SSH_URL"
+          echo "Removing and recreating origin_ssh remote..."
+          git remote remove origin_ssh
+          git remote add origin_ssh "$SSH_URL"
+          git fetch origin_ssh || echo "Warning: Failed to fetch from origin_ssh"
+        else
+          echo "origin_ssh remote already exists with correct URL: $EXISTING_SSH_URL"
+        fi
+      fi
+  script:
+    - echo "Debug environment variables"
+    - echo "CI_COMMIT_BRANCH=$CI_COMMIT_BRANCH"
+    - echo "CI_COMMIT_SHA=$CI_COMMIT_SHA"
+    - echo "CI_COMMIT_SHORT_SHA=$CI_COMMIT_SHORT_SHA"
+    - echo "CI_PIPELINE_ID=$CI_PIPELINE_ID"
+    - |
+      # Extract commit range from CI_COMMIT_BEFORE_SHA to CI_COMMIT_SHA
+      # If CI_COMMIT_BEFORE_SHA is not set (first push), use parent commit
+      if [ -z "$CI_COMMIT_BEFORE_SHA" ] || [ "$CI_COMMIT_BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+        COMMIT_BEFORE=$(git rev-parse HEAD~1 2>/dev/null || echo "$CI_COMMIT_SHA")
+      else
+        COMMIT_BEFORE="$CI_COMMIT_BEFORE_SHA"
+      fi
+      COMMIT_RANGE="${COMMIT_BEFORE}...${CI_COMMIT_SHA}"
+      echo "Extracted commit range: $COMMIT_RANGE"
+    - |
+      # Create coding branch to track work in progress
+      RUN_SUFFIX="_run_${CI_PIPELINE_ID}"
+      CODING_BRANCH="${CODING_BRANCH_PREFIX}/${CI_COMMIT_BRANCH}_${SHA_SHORT}${RUN_SUFFIX}"
+      echo "Creating coding branch: $CODING_BRANCH"
+
+      # Delete remote coding branch if it exists (using origin_ssh)
+      if git ls-remote --heads origin_ssh "$CODING_BRANCH" | grep -q "$CODING_BRANCH"; then
+        echo "Deleting existing remote coding branch: $CODING_BRANCH"
+        git push origin_ssh --delete "$CODING_BRANCH" 2>/dev/null || echo "Failed to delete remote coding branch"
+      fi
+
+      # Push current HEAD to coding branch with retry logic (using origin_ssh)
+      RETRY_COUNT=0
+      MAX_RETRIES=3
+      while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+        if git push -u origin_ssh "HEAD:refs/heads/$CODING_BRANCH"; then
+          echo "Successfully pushed to coding branch: $CODING_BRANCH"
+          break
+        else
+          RETRY_COUNT=$((RETRY_COUNT + 1))
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "Failed to push branch after $MAX_RETRIES attempts"
+            exit 1
+          fi
+          SLEEP_TIME=$((2 ** RETRY_COUNT))
+          echo "Push failed (attempt $RETRY_COUNT/$MAX_RETRIES), retrying in $SLEEP_TIME seconds..."
+          sleep $SLEEP_TIME
+        fi
+      done
+    - |
+      # Sync git submodules if .gitmodules exists
+      if [ -f ".gitmodules" ]; then
+        echo "Detected .gitmodules file, syncing submodules..."
+        git submodule init && echo "Submodules initialized" || echo "Failed to initialize submodules"
+        git submodule update --recursive && echo "Submodules updated" || echo "Failed to update submodules"
+      else
+        echo "No .gitmodules file found, skipping submodule sync"
+      fi
+    - |
+      # Prepare commit range for coding agent
+      echo "Showing changes for commit range: $COMMIT_RANGE"
+      git --no-pager diff --no-color "$COMMIT_RANGE" || echo "Failed to show diff for range: $COMMIT_RANGE"
+    - |
+      # Execute Claude Code Agent
+      BRANCH_NAME_SAFE=$(echo "$CI_COMMIT_BRANCH" | tr '/' '_')
+
+      # Check if branch name is too long (> 32 chars), use MD5 hash for truncation
+      if [ ${#BRANCH_NAME_SAFE} -gt 32 ]; then
+        BRANCH_NAME_HASH=$(echo -n "$BRANCH_NAME_SAFE" | md5sum | cut -d' ' -f1)
+        BRANCH_NAME_TRUNCATED="${BRANCH_NAME_SAFE:0:32}_${BRANCH_NAME_HASH}"
+        JSON_OUTPUT_FILE="/tmp/gitlab_${BRANCH_NAME_TRUNCATED}_${CI_COMMIT_SHA}.json"
+        echo "Branch name too long (${#BRANCH_NAME_SAFE} chars), using truncated name with MD5 hash"
+      else
+        JSON_OUTPUT_FILE="/tmp/gitlab_${BRANCH_NAME_SAFE}_${CI_COMMIT_SHA}.json"
+      fi
+
+      # Randomly select between cc_runner and cc_todomaker (50/50 chance)
+      RANDOM_NUMBER=$((RANDOM % 2))
+      if [ "$RANDOM_NUMBER" -eq 0 ]; then
+        RANDOM_COMMAND="/cc_runner"
+      else
+        RANDOM_COMMAND="/cc_todomaker"
+      fi
+      echo "Randomly selected command: $RANDOM_COMMAND"
+
+      # ========== BEGIN INLINED execute_code_agent.sh ==========
+      # Script logic expanded inline for visibility of all intermediate outputs
+
+      WORKTREE_PATH="$(pwd)"
+      BRANCH_NAME="$CI_COMMIT_BRANCH"
+
+      echo "=================================================="
+      echo "=============== Debugging Information ==============="
+      echo "Current working directory: $(pwd)"
+      echo "Current branch: $(git branch --show-current)"
+      echo "Current commit: $(git rev-parse HEAD)"
+      echo "Commit message: $(git log -1 --pretty=%B)"
+      echo "===================================================="
+      echo "Using commit range: $COMMIT_RANGE"
+      echo "Claude output will be saved to: $JSON_OUTPUT_FILE"
+
+      # Track Codex model type
+      CODEX_MODEL=""
+
+      # Track which agent was used
+      USED_AGENT=""
+
+      # Extract command name without slash
+      USED_COMMAND=$(echo "$RANDOM_COMMAND" | sed 's|/||g')
+
+      # Track execution start time
+      EXEC_START_TIME=$(date +%s)
+
+      AGENT_EXIT_CODE=1
+
+      # Check if branch starts with ai/search
+      if [[ "$BRANCH_NAME" == ai/search* ]]; then
+          echo "Branch starts with 'ai/search', applying search-focused agent distribution"
+          SEARCH_COMMAND="/cc_searcher"
+          USED_COMMAND=$(echo "$SEARCH_COMMAND" | sed 's|/||g')
+          SEARCH_RANDOM_CHOICE=$((RANDOM % 3))
+          if [ "$SEARCH_RANDOM_CHOICE" -eq 0 ]; then
+            echo "ai/search branch selected: Codex document search agent (25% chance)"
+            USED_AGENT="codex"
+            CODEX_MODEL="${CODEX_SEARCH_MODEL:-gpt-5.2}"
+            echo ">>> Executing Codex search agent..."
+            # Use subshell to capture exit code without causing script exit on failure
+            set +e  # Temporarily disable exit on error
+            codex exec -m "${CODEX_SEARCH_MODEL:-gpt-5.2}" --dangerously-bypass-approvals-and-sandbox --enable web_search_request "Act as the cc_searcher agent. the diff range is $COMMIT_RANGE" 2>&1 | tee "$JSON_OUTPUT_FILE"
+            AGENT_EXIT_CODE=${PIPESTATUS[0]}
+            set -e  # Re-enable exit on error
+            echo "Codex search agent exit code: $AGENT_EXIT_CODE"
+            # Check if Codex hit rate limit, API request error, or timeout
+            if tail -1 "$JSON_OUTPUT_FILE" | grep -qiE "hit.*limit.*try.*again.*in|error.*sending.*request.*for|timeout|timed.?out|context.*deadline.*exceeded"; then
+              echo "Codex hit rate limit, API error, or timeout, switching to Claude..."
+              USED_AGENT="claude"
+              echo ">>> Executing Claude (rate limit fallback)..."
+              claude --permission-mode plan --verbose --dangerously-skip-permissions --output-format stream-json -p "$SEARCH_COMMAND $COMMIT_RANGE" 2>&1 | tee "$JSON_OUTPUT_FILE"
+              AGENT_EXIT_CODE=${PIPESTATUS[0]}
+              echo "Claude (rate limit fallback) exit code: $AGENT_EXIT_CODE"
+            elif [ "$AGENT_EXIT_CODE" -ne 0 ]; then
+              echo "Codex search agent failed with exit code $AGENT_EXIT_CODE, falling back to Claude..."
+              USED_AGENT="claude"
+              echo ">>> Executing Claude fallback..."
+              claude --permission-mode plan --verbose --dangerously-skip-permissions --output-format stream-json -p "$SEARCH_COMMAND $COMMIT_RANGE" 2>&1 | tee "$JSON_OUTPUT_FILE"
+              AGENT_EXIT_CODE=${PIPESTATUS[0]}
+              echo "Claude fallback exit code: $AGENT_EXIT_CODE"
+            fi
+          else
+            echo "ai/search branch selected: Claude document search agent (75% chance)"
+            USED_AGENT="claude"
+            echo ">>> Executing Claude search agent..."
+            claude --permission-mode plan --verbose --dangerously-skip-permissions --output-format stream-json -p "$SEARCH_COMMAND $COMMIT_RANGE" 2>&1 | tee "$JSON_OUTPUT_FILE"
+            AGENT_EXIT_CODE=${PIPESTATUS[0]}
+            echo "Claude search agent exit code: $AGENT_EXIT_CODE"
+
+            if [ "$AGENT_EXIT_CODE" -ne 0 ]; then
+              echo "Claude search agent failed with exit code $AGENT_EXIT_CODE, falling back to Codex..."
+              USED_AGENT="codex"
+              CODEX_MODEL="${CODEX_SEARCH_MODEL:-gpt-5.2}"
+              echo ">>> Executing Codex fallback..."
+              set +e  # Temporarily disable exit on error
+              codex exec -m "${CODEX_SEARCH_MODEL:-gpt-5.2}" --dangerously-bypass-approvals-and-sandbox --enable web_search_request "Act as the cc_searcher agent. the diff range is $COMMIT_RANGE" 2>&1 | tee "$JSON_OUTPUT_FILE"
+              AGENT_EXIT_CODE=${PIPESTATUS[0]}
+              set -e  # Re-enable exit on error
+              echo "Codex fallback exit code: $AGENT_EXIT_CODE"
+
+              # Check if Codex hit rate limit, API request error, or timeout
+              if tail -1 "$JSON_OUTPUT_FILE" | grep -qiE "hit.*limit.*try.*again.*in|error.*sending.*request.*for|timeout|timed.?out|context.*deadline.*exceeded"; then
+                echo "Codex hit rate limit, API error, or timeout, switching back to Claude..."
+                USED_AGENT="claude"
+                echo ">>> Executing Claude (rate limit fallback)..."
+                claude --permission-mode plan --verbose --dangerously-skip-permissions --output-format stream-json -p "$SEARCH_COMMAND $COMMIT_RANGE" 2>&1 | tee "$JSON_OUTPUT_FILE"
+                AGENT_EXIT_CODE=${PIPESTATUS[0]}
+                echo "Claude (rate limit fallback) exit code: $AGENT_EXIT_CODE"
+              fi
+            fi
+          fi
+      else
+        # Use random selection for non-search branches
+        # Generate random value 0-5 to support a 5:1 Claude:Codex split (16.7% Codex / 83.3% Claude)
+        RANDOM_CHOICE=$((RANDOM % 5))
+        # Select Codex for value 0 (16.7% probability), Claude for values 1-5 (83.3% probability)
+        if [ "$RANDOM_CHOICE" -eq 0 ]; then
+          echo "Randomly selected: Codex agent (16.7% chance)"
+          USED_AGENT="codex"
+          CODEX_MODEL="${CODEX_RUNNER_MODEL:-gpt-5.2-codex}"
+          echo ">>> Executing Codex agent..."
+          set +e  # Temporarily disable exit on error
+          codex exec -m "${CODEX_RUNNER_MODEL:-gpt-5.2-codex}" -s danger-full-access --enable web_search_request "Act as the cc_runner agent. the diff range is $COMMIT_RANGE" 2>&1 | tee "$JSON_OUTPUT_FILE"
+          AGENT_EXIT_CODE=${PIPESTATUS[0]}
+          set -e  # Re-enable exit on error
+          echo "Codex exit code: $AGENT_EXIT_CODE"
+
+          # Check if Codex hit rate limit, API request error, or timeout
+          if tail -1 "$JSON_OUTPUT_FILE" | grep -qiE "hit.*limit.*try.*again.*in|error.*sending.*request.*for|timeout|timed.?out|context.*deadline.*exceeded"; then
+            echo "Codex hit rate limit, API error, or timeout, switching to Claude..."
+            USED_AGENT="claude"
+            echo ">>> Executing Claude (rate limit fallback)..."
+            claude --permission-mode plan --verbose --dangerously-skip-permissions --output-format stream-json -p "$RANDOM_COMMAND $COMMIT_RANGE" 2>&1 | tee "$JSON_OUTPUT_FILE"
+            AGENT_EXIT_CODE=${PIPESTATUS[0]}
+            echo "Claude (rate limit fallback) exit code: $AGENT_EXIT_CODE"
+          elif [ "$AGENT_EXIT_CODE" -ne 0 ]; then
+            echo "Codex failed with exit code $AGENT_EXIT_CODE, falling back to Claude..."
+            USED_AGENT="claude"
+            echo ">>> Executing Claude fallback..."
+            claude --permission-mode plan --verbose --dangerously-skip-permissions --output-format stream-json -p "$RANDOM_COMMAND $COMMIT_RANGE" 2>&1 | tee "$JSON_OUTPUT_FILE"
+            AGENT_EXIT_CODE=${PIPESTATUS[0]}
+            echo "Claude fallback exit code: $AGENT_EXIT_CODE"
+          fi
+        else
+          echo "Randomly selected: Claude Code agent (83.3% chance)"
+          USED_AGENT="claude"
+          echo ">>> Executing Claude Code agent..."
+          claude --permission-mode plan --verbose --dangerously-skip-permissions --output-format stream-json -p "$RANDOM_COMMAND $COMMIT_RANGE" 2>&1 | tee "$JSON_OUTPUT_FILE"
+          AGENT_EXIT_CODE=${PIPESTATUS[0]}
+          echo "Claude exit code: $AGENT_EXIT_CODE"
+
+          if [ "$AGENT_EXIT_CODE" -ne 0 ]; then
+            echo "Claude failed with exit code $AGENT_EXIT_CODE, falling back to Codex..."
+            USED_AGENT="codex"
+            CODEX_MODEL="${CODEX_RUNNER_MODEL:-gpt-5.2-codex}"
+            echo ">>> Executing Codex fallback..."
+            set +e  # Temporarily disable exit on error
+            codex exec -m "${CODEX_RUNNER_MODEL:-gpt-5.2-codex}" -s danger-full-access --enable web_search_request "Act as the cc_runner agent. the diff range is $COMMIT_RANGE" 2>&1 | tee "$JSON_OUTPUT_FILE"
+            AGENT_EXIT_CODE=${PIPESTATUS[0]}
+            set -e  # Re-enable exit on error
+            echo "Codex fallback exit code: $AGENT_EXIT_CODE"
+
+            # Check if Codex hit rate limit, API request error, or timeout
+            if tail -1 "$JSON_OUTPUT_FILE" | grep -qiE "hit.*limit.*try.*again.*in|error.*sending.*request.*for|timeout|timed.?out|context.*deadline.*exceeded"; then
+              echo "Codex hit rate limit, API error, or timeout, switching back to Claude..."
+              USED_AGENT="claude"
+              echo ">>> Executing Claude (rate limit fallback)..."
+              claude --permission-mode plan --verbose --dangerously-skip-permissions --output-format stream-json -p "$RANDOM_COMMAND $COMMIT_RANGE" 2>&1 | tee "$JSON_OUTPUT_FILE"
+              AGENT_EXIT_CODE=${PIPESTATUS[0]}
+              echo "Claude (rate limit fallback) exit code: $AGENT_EXIT_CODE"
+            fi
+          fi
+        fi
+      fi
+
+      echo "Last line of agent output:"
+      tail -1 "$JSON_OUTPUT_FILE"
+
+      # Only parse Claude JSON output, skip for Codex
+      if [ "$USED_AGENT" = "claude" ]; then
+        echo "Output is from Claude, parsing JSON for errors..."
+        python3 ./ci_scripts/parse_claude_code_result.py "$JSON_OUTPUT_FILE"
+        PARSE_EXIT_CODE=$?
+        echo "Parser exit code: $PARSE_EXIT_CODE"
+      else
+        echo "Output is from Codex, skipping Claude-specific JSON parsing"
+        PARSE_EXIT_CODE=0
+      fi
+
+      if [ $AGENT_EXIT_CODE -eq 0 ] && [ $PARSE_EXIT_CODE -eq 0 ]; then
+        echo "✅ Agent execution succeeded"
+        SCRIPT_EXIT_CODE=0
+      else
+        echo "❌ Agent execution failed"
+        SCRIPT_EXIT_CODE=1
+      fi
+
+      # Track execution end time and calculate duration
+      EXEC_END_TIME=$(date +%s)
+      EXEC_DURATION=$((EXEC_END_TIME - EXEC_START_TIME))
+      EXEC_DURATION_MINUTES=$((EXEC_DURATION / 60))
+      EXEC_DURATION_SECONDS=$((EXEC_DURATION % 60))
+      echo "Execution duration: ${EXEC_DURATION} seconds"
+      echo "Execution duration formatted: ${EXEC_DURATION_MINUTES} minutes ${EXEC_DURATION_SECONDS} seconds"
+
+      # Upload execution duration to Kuma monitoring
+      # Calculate minutes, rounding up for sub-minute values (ceiling)
+      if [ "$EXEC_DURATION_SECONDS" -gt 0 ]; then
+        EXEC_DURATION_MINUTES_ROUNDED=$((EXEC_DURATION_MINUTES + 1))
+      else
+        EXEC_DURATION_MINUTES_ROUNDED=$EXEC_DURATION_MINUTES
+      fi
+      # Ensure at least 1 minute is reported
+      if [ "$EXEC_DURATION_MINUTES_ROUNDED" -eq 0 ]; then
+        EXEC_DURATION_MINUTES_ROUNDED=1
+      fi
+      echo "Execution duration for Kuma: ${EXEC_DURATION_MINUTES_ROUNDED} minutes (rounded up)"
+
+      # Send metrics to Kuma uptime monitor if token is configured
+      if [ -n "$CARLOS_KUMA_AGENT_TASK_MOINTOR_TOKEN" ]; then
+        KUMA_URL="http://carlosmacmini.codecola.uk:3001/api/push/${CARLOS_KUMA_AGENT_TASK_MOINTOR_TOKEN}?status=up&msg=OK&ping=${EXEC_DURATION_MINUTES_ROUNDED}"
+        echo "Uploading execution metrics to Kuma..."
+        curl -s -o /dev/null -w "Kuma response code: %{http_code}\n" "$KUMA_URL" || echo "Warning: Failed to upload metrics to Kuma"
+      else
+        echo "CARLOS_KUMA_AGENT_TASK_MOINTOR_TOKEN not set, skipping Kuma metrics upload"
+      fi
+
+      # Export results for consumption
+      echo "USED_AGENT=$USED_AGENT"
+      echo "USED_COMMAND=$USED_COMMAND"
+      echo "EXEC_DURATION=$EXEC_DURATION"
+      echo "EXEC_DURATION_MINUTES=$EXEC_DURATION_MINUTES"
+      echo "EXEC_DURATION_SECONDS=$EXEC_DURATION_SECONDS"
+      echo "CODEX_MODEL=$CODEX_MODEL"
+
+      echo "========== END INLINED execute_code_agent.sh =========="
+
+      # Variables are now set directly inline, no need to parse from OUTPUT_FILE
+
+      # Save variables to env file for other jobs
+      echo "USED_AGENT=$USED_AGENT" >> "$ENV_FILE"
+      echo "USED_COMMAND=$USED_COMMAND" >> "$ENV_FILE"
+      echo "EXEC_DURATION=$EXEC_DURATION" >> "$ENV_FILE"
+      echo "EXEC_DURATION_MINUTES=$EXEC_DURATION_MINUTES" >> "$ENV_FILE"
+      echo "EXEC_DURATION_SECONDS=$EXEC_DURATION_SECONDS" >> "$ENV_FILE"
+      echo "CODEX_MODEL=$CODEX_MODEL" >> "$ENV_FILE"
+      echo "COMMIT_RANGE=$COMMIT_RANGE" >> "$ENV_FILE"
+      echo "CODING_BRANCH=$CODING_BRANCH" >> "$ENV_FILE"
+      echo "RUN_SUFFIX=$RUN_SUFFIX" >> "$ENV_FILE"
+
+      # Debug: Print ENV_FILE path and contents after saving variables
+      echo "========== DEBUG: ENV_FILE after saving variables =========="
+      echo "ENV_FILE path: $ENV_FILE"
+      echo "ENV_FILE exists: $(test -f "$ENV_FILE" && echo 'YES' || echo 'NO')"
+      if [ -f "$ENV_FILE" ]; then
+        echo "ENV_FILE contents:"
+        cat "$ENV_FILE"
+        echo "ENV_FILE size: $(wc -c < "$ENV_FILE") bytes"
+      fi
+      echo "============================================================"
+
+      # Build agent info for branch name
+      if [ "$USED_AGENT" = "claude" ]; then
+        if [ -n "$USED_COMMAND" ]; then
+          AGENT_INFO="claude/${USED_COMMAND}"
+        else
+          AGENT_INFO="claude"
+        fi
+      else
+        if [ -n "$CODEX_MODEL" ]; then
+          AGENT_INFO="codex/${CODEX_MODEL}"
+        else
+          AGENT_INFO="codex"
+        fi
+      fi
+
+      # Include execution time in the branch name
+      if [ -n "$EXEC_DURATION_MINUTES" ] && [ -n "$EXEC_DURATION_SECONDS" ]; then
+        TIMING_INFO="${EXEC_DURATION_MINUTES}_min/${EXEC_DURATION_SECONDS}_sec"
+      elif [ -n "$EXEC_DURATION" ]; then
+        TIMING_INFO="${EXEC_DURATION}s"
+      else
+        TIMING_INFO=""
+      fi
+
+      # Handle success or failure branch push based on script exit code
+      if [ "$SCRIPT_EXIT_CODE" -eq 0 ]; then
+        # Success: push to completion branch
+        COMPLETION_BRANCH="${COMPLETE_BRANCH_PREFIX}/${AGENT_INFO}/${TIMING_INFO}/${CI_COMMIT_BRANCH}/${SHA_SHORT}${RUN_SUFFIX}"
+        echo "Creating completion branch: $COMPLETION_BRANCH"
+        # Save completion branch to ENV_FILE for sync_completion_to_gitea job
+        echo "COMPLETION_BRANCH=$COMPLETION_BRANCH" >> "$ENV_FILE"
+        echo "SCRIPT_EXIT_CODE=$SCRIPT_EXIT_CODE" >> "$ENV_FILE"
+
+        # Handle ai/search branches - clear todo.md files
+        if [[ "$CI_COMMIT_BRANCH" == ai/search* ]]; then
+          echo "Branch $CI_COMMIT_BRANCH detected; ensuring all todo.md variants are cleared before completion push"
+
+          TODO_FILES=()
+          while IFS= read -r -d '' TODO_PATH; do
+            TODO_FILES+=("$TODO_PATH")
+          done < <(find . -type f -iname 'todo.md' -print0)
+
+          TODO_COUNT=${#TODO_FILES[@]}
+          if [ "$TODO_COUNT" -eq 0 ]; then
+            echo "No todo.md (case-insensitive) files found to clear"
+          else
+            echo "Found $TODO_COUNT todo.md file(s) to clear"
+            for TODO_PATH in "${TODO_FILES[@]}"; do
+              if [ -s "$TODO_PATH" ]; then
+                : > "$TODO_PATH"
+                echo "Cleared existing contents in $TODO_PATH"
+              else
+                echo "$TODO_PATH already empty"
+              fi
+            done
+
+            git add -- "${TODO_FILES[@]}"
+            if git diff --staged --quiet -- "${TODO_FILES[@]}"; then
+              echo "No changes detected in todo.md files after clearing"
+              git reset -- "${TODO_FILES[@]}"
+            else
+              git commit -m "chore: clear todo.md files for ai/search completion"
+            fi
+          fi
+        fi
+
+        # Commit any remaining changes
+        # Delete task_status.env before staging (useful for branch naming but should not be committed)
+        if [ -f "task_status.env" ]; then
+          rm -f task_status.env
+          echo "Deleted task_status.env before final commit"
+        fi
+        git add -A
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "chore: claude code agent processing complete"
+        fi
+
+        # Force push to completion branch with retry logic (using origin_ssh)
+        # Push based on coding branch
+        echo "Force pushing coding branch HEAD to remote branch: $COMPLETION_BRANCH"
+
+        RETRY_COUNT=0
+        MAX_RETRIES=3
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+          if git push origin_ssh "HEAD:refs/heads/$COMPLETION_BRANCH" --force; then
+            echo "Git push completed successfully"
+            break
+          else
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+              echo "Git push failed after $MAX_RETRIES attempts"
+              exit 1
+            fi
+            SLEEP_TIME=$((2 ** RETRY_COUNT))
+            echo "Push failed (attempt $RETRY_COUNT/$MAX_RETRIES), retrying in $SLEEP_TIME seconds..."
+            sleep $SLEEP_TIME
+          fi
+        done
+
+        echo "Pushed to completion branch: $COMPLETION_BRANCH"
+
+        # Debug: Check ENV_FILE after pushing to completion branch
+        echo "========== DEBUG: ENV_FILE after completion branch push =========="
+        echo "ENV_FILE path: $ENV_FILE"
+        echo "ENV_FILE exists: $(test -f "$ENV_FILE" && echo 'YES' || echo 'NO')"
+        if [ -f "$ENV_FILE" ]; then
+          echo "ENV_FILE size: $(wc -c < "$ENV_FILE") bytes"
+        fi
+        echo "=================================================================="
+
+        # Delete the coding branch after successful push (using origin_ssh)
+        echo "Deleting coding branch: $CODING_BRANCH"
+
+        RETRY_COUNT=0
+        MAX_RETRIES=3
+        DELETED=false
+
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+          if git push origin_ssh --delete "$CODING_BRANCH" 2>/dev/null; then
+            echo "Successfully deleted coding branch: $CODING_BRANCH"
+            DELETED=true
+            break
+          else
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+              echo "Could not delete coding branch after $MAX_RETRIES attempts: $CODING_BRANCH (may not exist)"
+            else
+              SLEEP_TIME=$((2 ** RETRY_COUNT))
+              echo "Delete failed (attempt $RETRY_COUNT/$MAX_RETRIES), retrying in $SLEEP_TIME seconds..."
+              sleep $SLEEP_TIME
+            fi
+          fi
+        done
+
+        # Cleanup ai/ and related branches after successful completion
+        echo "Cleaning up ai/ related branches after use_agent_to_code success..."
+        REPO_PATH_B64=$(printf '%s' "$(pwd)" | base64 -w 0)
+        SOURCE_BRANCH_B64=$(printf '%s' "$CI_COMMIT_BRANCH" | base64 -w 0)
+        if emacs --batch --load ~/.emacs.d/init.el --load ~/carlos-spacemacs-config/layers/carlos/local/agent_workflow_tools.el --eval "(carlos/cleanup-ai-flow-branches \"$REPO_PATH_B64\" \"$SOURCE_BRANCH_B64\" t)"; then
+          echo "Branch cleanup succeeded"
+        else
+          echo "Branch cleanup failed (non-fatal)"
+        fi
+      else
+        # Failure: push to failure branch
+        FAILURE_BRANCH="${FAIL_BRANCH_PREFIX}/${AGENT_INFO}/${CI_COMMIT_BRANCH}_${SHA_SHORT}${RUN_SUFFIX}"
+        echo "Creating failure branch: $FAILURE_BRANCH"
+        # Save failure branch to ENV_FILE for sync jobs
+        echo "FAILURE_BRANCH=$FAILURE_BRANCH" >> "$ENV_FILE"
+        echo "SCRIPT_EXIT_CODE=$SCRIPT_EXIT_CODE" >> "$ENV_FILE"
+
+        # Commit any changes
+        # Delete task_status.env before staging (useful for branch naming but should not be committed)
+        if [ -f "task_status.env" ]; then
+          rm -f task_status.env
+          echo "Deleted task_status.env before final commit"
+        fi
+        git add -A
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "chore: claude code agent processing failed"
+        fi
+
+        # Force push to failure branch (using origin_ssh)
+        echo "Force pushing HEAD to remote branch: $FAILURE_BRANCH"
+        git push origin_ssh "HEAD:refs/heads/$FAILURE_BRANCH" --force
+        echo "Pushed to failure branch: $FAILURE_BRANCH"
+
+        # Debug: Check ENV_FILE after pushing to failure branch
+        echo "========== DEBUG: ENV_FILE after failure branch push =========="
+        echo "ENV_FILE path: $ENV_FILE"
+        echo "ENV_FILE exists: $(test -f "$ENV_FILE" && echo 'YES' || echo 'NO')"
+        if [ -f "$ENV_FILE" ]; then
+          echo "ENV_FILE size: $(wc -c < "$ENV_FILE") bytes"
+        fi
+        echo "==============================================================="
+
+        # Delete coding branch with retry logic (using origin_ssh)
+        echo "Deleting coding branch: $CODING_BRANCH"
+
+        RETRY_COUNT=0
+        MAX_RETRIES=3
+        DELETED=false
+
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+          if git push origin_ssh --delete "$CODING_BRANCH" 2>/dev/null; then
+            echo "Successfully deleted coding branch: $CODING_BRANCH"
+            DELETED=true
+            break
+          fi
+
+          RETRY_COUNT=$((RETRY_COUNT + 1))
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "Could not delete coding branch after $MAX_RETRIES attempts: $CODING_BRANCH (may not exist)"
+            break
+          fi
+
+          SLEEP_TIME=$((2 ** RETRY_COUNT))
+          echo "Delete failed (attempt $RETRY_COUNT/$MAX_RETRIES), retrying in $SLEEP_TIME seconds..."
+          sleep $SLEEP_TIME
+        done
+
+        if [ "$DELETED" = true ]; then
+          echo "Cleanup completed for coding branch"
+        else
+          echo "Coding branch may still exist: $CODING_BRANCH"
+        fi
+
+        # Cleanup ai/ and related branches after failure
+        echo "Cleaning up ai/ related branches after use_agent_to_code failure..."
+        REPO_PATH_B64=$(printf '%s' "$(pwd)" | base64 -w 0)
+        SOURCE_BRANCH_B64=$(printf '%s' "$CI_COMMIT_BRANCH" | base64 -w 0)
+        if emacs --batch --load ~/.emacs.d/init.el --load ~/carlos-spacemacs-config/layers/carlos/local/agent_workflow_tools.el --eval "(carlos/cleanup-ai-flow-branches \"$REPO_PATH_B64\" \"$SOURCE_BRANCH_B64\" t)"; then
+          echo "Branch cleanup succeeded"
+        else
+          echo "Branch cleanup failed (non-fatal)"
+        fi
+
+        # Debug: Final check before exit on failure path
+        echo "========== DEBUG: ENV_FILE final check (failure path) =========="
+        echo "ENV_FILE path: $ENV_FILE"
+        echo "ENV_FILE exists: $(test -f "$ENV_FILE" && echo 'YES' || echo 'NO')"
+        echo "================================================================="
+        # Move ENV_FILE to repository root for artifact upload (GitLab can only upload files from within the repo)
+        if [ -f "$ENV_FILE" ]; then
+          ENV_FILE_BASENAME=$(basename "$ENV_FILE")
+          mv "$ENV_FILE" "./$ENV_FILE_BASENAME"
+          echo "Moved $ENV_FILE to ./$ENV_FILE_BASENAME for artifact upload"
+        fi
+
+        # Exit with the script's exit code
+        exit $SCRIPT_EXIT_CODE
+      fi
+
+      # Debug: Final check at end of script (success path)
+      echo "========== DEBUG: ENV_FILE final check (success path) =========="
+      echo "ENV_FILE path: $ENV_FILE"
+      echo "ENV_FILE exists: $(test -f "$ENV_FILE" && echo 'YES' || echo 'NO')"
+      if [ -f "$ENV_FILE" ]; then
+        echo "ENV_FILE contents:"
+        cat "$ENV_FILE"
+      fi
+      echo "================================================================="
+      # Move ENV_FILE to repository root for artifact upload (GitLab can only upload files from within the repo)
+      if [ -f "$ENV_FILE" ]; then
+        ENV_FILE_BASENAME=$(basename "$ENV_FILE")
+        mv "$ENV_FILE" "./$ENV_FILE_BASENAME"
+        echo "Moved $ENV_FILE to ./$ENV_FILE_BASENAME for artifact upload"
+      fi
+  artifacts:
+    paths:
+      - .env_gitlab_*
+    expire_in: 24 hour
+    when: always
+
+
+# Job 1: Find available tasks - discovers org tasks and creates context file
+# This job succeeds when a task is found, fails when no tasks available
+# The execute_ai_agent job depends on this and only runs on success
+find_available_task:
+  stage: find_task_for_agent
+  tags:
+    - linux
+  rules:
+    # Trigger on scheduled pipelines
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: always
+    # Trigger when CARLOS_RUN_MODE is set to agent-iter (for local cron-triggered pipelines)
+    - if: $CARLOS_RUN_MODE == "agent-iter"
+      when: always
+  script:
+    - echo "CARLOS_RUN_MODE=$CARLOS_RUN_MODE"
+    - echo "Running task discovery (find_available_task)..."
+    - echo "Removing artifacts old files..."
+    - rm -f agent_report.txt context_for_agent.txt ci_result_status.txt
+    - |
+      # Sync remote branches by fetching and pruning stale references
+      echo "Fetching all remote branches with prune..."
+      git fetch origin --prune || echo "Warning: git fetch --all --prune failed"
+      echo "Remote branch sync completed"
+    - |
+      # Find *.org files in the repository root directory only
+      send_pushdeer_notification() {
+        local text="$1"
+        local minute_now
+        minute_now=$(date +%M)
+        local minute_value=$((10#$minute_now))
+        local minute_mod=$((minute_value % 10))
+        if [ "$minute_mod" -gt 3 ] && [ "$minute_mod" -lt 7 ]; then
+          echo "Current minute $minute_value outside notification window, skipping PushDeer"
+          return 0
+        fi
+        local project_id="${CI_PROJECT_ID:-N/A}"
+        local pipeline_id="${CI_PIPELINE_ID:-N/A}"
+        local api_base="${CI_API_V4_URL:-}"
+        local pipeline_url=""
+        if [ -n "$api_base" ] && [ "$project_id" != "N/A" ] && [ "$pipeline_id" != "N/A" ]; then
+          pipeline_url="${api_base}/projects/${project_id}/pipelines/${pipeline_id}"
+        fi
+        local text_with_meta="${text} (project:${project_id})"
+        if [ -n "$pipeline_url" ]; then
+          text_with_meta="${text_with_meta} restclient:${pipeline_url}"
+        fi
+        if [ -n "$PUSHDEER_URL" ] && [ -n "$PUSHDEER_TOKEN" ]; then
+          local http_code
+          http_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 \
+            -d "text=${text_with_meta}&pushkey=${PUSHDEER_TOKEN}" \
+            -H "Content-type: application/x-www-form-urlencoded" \
+            "$PUSHDEER_URL" || true)
+          if [ "$http_code" = "200" ]; then
+            echo "PushDeer notification sent successfully"
+          else
+            echo "PushDeer notification failed (HTTP: $http_code)"
+          fi
+        else
+          echo "PushDeer environment variables not set, skipping notification"
+        fi
+      }
+
+      ORG_FILES=($(ls -1 *.org 2>/dev/null || true))
+      ORG_COUNT=${#ORG_FILES[@]}
+
+      echo "Found $ORG_COUNT org file(s) in repository root"
+
+      if [ "$ORG_COUNT" -eq 0 ]; then
+        echo "No *.org files found in repository root"
+        echo "TASK_FOUND=false" > task_status.env
+        echo "no_task" > ci_result_status.txt
+        exit 1
+      fi
+
+      # List all org files found
+      echo "Org files found:"
+      for f in "${ORG_FILES[@]}"; do
+        echo "  - $f"
+      done
+
+      # Initialize common variables
+      REPO_PATH="$(pwd)"
+      CONTEXT_FILE="context_for_agent.txt"
+      PIPELINE_ID="${CI_PIPELINE_ID:-}"
+
+      # Iterate through org files, process first one with available tasks
+      for ORG_FILE in "${ORG_FILES[@]}"; do
+        echo ""
+        echo "Processing org file: $ORG_FILE"
+        echo "Last line of $ORG_FILE:"
+        tail -1 "$ORG_FILE"
+
+        # Clear context file for each iteration
+        rm -f "$REPO_PATH/$CONTEXT_FILE"
+
+        # Call emacs function to get leaf headings as JSON
+        echo "Calling emacs to get leaf headings JSON..."
+        if emacs --batch --load ~/.emacs.d/init.el --load ~/carlos-spacemacs-config/layers/carlos/local/agent_workflow_tools.el --eval "(progn (carlos/org-file-get-leaf-headings-json \"$ORG_FILE\" \"$REPO_PATH\" \"$CONTEXT_FILE\" '(\"AI\" \"ai\" \"CODE\" \"code\" \"RESEARCH\" \"research\" \"PLAN\" \"plan\") \"$PIPELINE_ID\" t))"; then
+          echo "emacs --batch call succeeded for $ORG_FILE"
+          # Check if context file exists and has content
+          if [ -f "$REPO_PATH/$CONTEXT_FILE" ] && [ -s "$REPO_PATH/$CONTEXT_FILE" ]; then
+            echo "Context file found with content: $REPO_PATH/$CONTEXT_FILE"
+            echo "=== Context for AI Agent ==="
+            cat "$REPO_PATH/$CONTEXT_FILE"
+            echo ""
+            echo "=== End of Context ==="
+            # Task found - save org file name and exit success
+            echo "ORG_FILE=$ORG_FILE" > task_status.env
+            echo "TASK_FOUND=true" >> task_status.env
+            TASK_START_TIME=$(date +%s)
+            echo "TASK_START_TIME=$TASK_START_TIME" >> task_status.env
+            echo "Task found in $ORG_FILE, execute_ai_agent job will run"
+            echo "Task start time recorded: $TASK_START_TIME"
+            exit 0
+          else
+            echo "No available tasks in $ORG_FILE, trying next file..."
+          fi
+        else
+          echo "emacs --batch call failed for $ORG_FILE"
+          send_pushdeer_notification "❌ emacs --batch获取叶子节点失败 (pipeline:${CI_PIPELINE_ID:-N/A}, file:$ORG_FILE)"
+          # Continue to next file instead of failing immediately
+          echo "Continuing to next org file..."
+        fi
+      done
+
+      # If we reach here, no tasks were found in any org file
+      echo ""
+      echo "No available tasks found in any of the $ORG_COUNT org files"
+      echo "TASK_FOUND=false" > task_status.env
+      echo "no_task" > ci_result_status.txt
+      exit 1
+  artifacts:
+    paths:
+      - context_for_agent.txt
+      - task_status.env
+      - ci_result_status.txt
+    when: always
+    expire_in: 24 hours
+    reports:
+      dotenv: task_status.env
+
+# Job 2: Execute AI agent - only runs when find_available_task succeeds and finds a task
+# This job is skipped (cancelled) when no tasks are available
+execute_worflow_ai_agent:
+  stage: agent_workflow_excute
+  tags:
+    - linux
+  needs:
+    - job: find_available_task
+      artifacts: true
+  rules:
+    # Trigger on scheduled pipelines
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: on_success
+    # Trigger when CARLOS_RUN_MODE is set to agent-iter (for local cron-triggered pipelines)
+    - if: $CARLOS_RUN_MODE == "agent-iter"
+      when: on_success
+  script:
+    - echo "CARLOS_RUN_MODE=$CARLOS_RUN_MODE"
+    - echo "Running AI agent execution (execute_ai_agent)..."
+    - |
+      # Check if task was found by find_available_task
+      if [ "$TASK_FOUND" != "true" ]; then
+        echo "No task found by find_available_task job, skipping AI execution"
+        echo "cancelled" > ci_result_status.txt
+        exit 1
+      fi
+    - |
+      REPO_PATH="$(pwd)"
+      CONTEXT_FILE="context_for_agent.txt"
+
+      # Verify context file exists and has content
+      if [ ! -f "$REPO_PATH/$CONTEXT_FILE" ] || [ ! -s "$REPO_PATH/$CONTEXT_FILE" ]; then
+        echo "Context file missing or empty, cannot execute AI agent"
+        echo "cancelled" > ci_result_status.txt
+        exit 1
+      fi
+
+      # Execute claude with /cc_org_agent_workflow command, passing context file as input
+      AGENT_JSON_OUTPUT="/tmp/agent_workflow_${CI_COMMIT_SHA}.json"
+      CONTEXT_HEADER=$(head -n 1 "$REPO_PATH/$CONTEXT_FILE")
+      if [ -z "$CONTEXT_HEADER" ]; then
+        echo "Context header missing; expected '<line>,<title>' on first line"
+        exit 1
+      fi
+
+      # Parse header format: line,title (first line)
+      IFS=',' read -r AGENT_TASK_LINE AGENT_TASK_TITLE <<< "$CONTEXT_HEADER"
+      # Read CODING_BRANCH_NAME from second line
+      CODING_BRANCH_NAME=$(sed -n '2p' "$REPO_PATH/$CONTEXT_FILE")
+      # Read agent command from third line (default to cc_org_agent_workflow)
+      AGENT_COMMAND_RAW=$(sed -n '3p' "$REPO_PATH/$CONTEXT_FILE" | tr -d '\r')
+      case "$AGENT_COMMAND_RAW" in
+        cc_org_agent_workflow|make_research|make_resarch|cc_plan)
+          AGENT_COMMAND="$AGENT_COMMAND_RAW"
+          ;;
+        *)
+          AGENT_COMMAND="cc_org_agent_workflow"
+          ;;
+      esac
+      echo "Parsed agent command: ${AGENT_COMMAND} (raw: ${AGENT_COMMAND_RAW:-<empty>})"
+      export AGENT_TASK_LINE AGENT_TASK_TITLE CODING_BRANCH_NAME
+      echo "Parsed task line: ${AGENT_TASK_LINE}"
+      echo "Parsed task title: ${AGENT_TASK_TITLE}"
+      echo "Parsed coding branch: ${CODING_BRANCH_NAME}"
+
+      CONTEXT_CONTENT=$(tail -n +4 "$REPO_PATH/$CONTEXT_FILE")
+
+      # Delete context_for_agent.txt after reading to prevent AI from accidentally committing it
+      echo "Deleting $CONTEXT_FILE after reading content..."
+      rm -f "$REPO_PATH/$CONTEXT_FILE"
+      echo "Context file deleted to prevent accidental git commits by AI agent"
+
+      # Alternating retry mechanism: Claude <-> Codex with max 3 attempts
+      # 4:1 random selection ratio for initial agent: 80% Claude, 20% Codex
+      RANDOM_CHOICE=$((RANDOM % 4))
+      AGENT_SUCCESS=false
+      USED_AGENT=""
+      MAX_RETRIES=3
+      RETRY_COUNT=0
+
+      # Determine initial agent based on random selection
+      if [ "$RANDOM_CHOICE" -eq 0 ]; then
+        CURRENT_AGENT="codex"
+        echo "Randomly selected initial agent: Codex (20% chance, 4:1 ratio)"
+      else
+        CURRENT_AGENT="claude"
+        echo "Randomly selected initial agent: Claude (80% chance, 4:1 ratio)"
+      fi
+
+      # Send PushDeer notification before agent execution starts (controlled by NOTIFY_TASK_START)
+      if [ "${NOTIFY_TASK_START:-true}" = "true" ]; then
+        if [ -n "$PUSHDEER_URL" ] && [ -n "$PUSHDEER_TOKEN" ]; then
+          NOTIFY_TEXT="🚂 ${AGENT_TASK_TITLE} (${CURRENT_AGENT}, Pipeline: ${CI_PIPELINE_ID})"
+          NOTIFY_TIMEOUT=10
+          NOTIFY_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m $NOTIFY_TIMEOUT \
+            -d "text=${NOTIFY_TEXT}&pushkey=${PUSHDEER_TOKEN}" \
+            -H "Content-type: application/x-www-form-urlencoded" \
+            "$PUSHDEER_URL" || true)
+          if [ "$NOTIFY_HTTP_CODE" = "200" ]; then
+            echo "PushDeer notification sent successfully"
+          else
+            echo "PushDeer notification failed (HTTP: $NOTIFY_HTTP_CODE), continuing..."
+          fi
+        else
+          echo "PushDeer environment variables not set, skipping notification"
+        fi
+      else
+        echo "Task start notification disabled (NOTIFY_TASK_START=${NOTIFY_TASK_START:-not set})"
+      fi
+
+      # Retry loop: alternates between Claude and Codex until success or max retries
+      while [ "$AGENT_SUCCESS" = "false" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+        RETRY_COUNT=$((RETRY_COUNT + 1))
+        USED_AGENT="$CURRENT_AGENT"
+        echo "=== Attempt $RETRY_COUNT/$MAX_RETRIES using $CURRENT_AGENT ==="
+
+        set +e  # Temporarily disable exit on error
+
+        if [ "$CURRENT_AGENT" = "claude" ]; then
+          # cc_plan expects: /cc_plan <org_file_path> <line_number>
+          if [ "$AGENT_COMMAND" = "cc_plan" ]; then
+            claude --permission-mode plan --verbose --dangerously-skip-permissions --output-format stream-json -p "/${AGENT_COMMAND} $ORG_FILE $AGENT_TASK_LINE" 2>&1 | tee "$AGENT_JSON_OUTPUT"
+          else
+            claude --permission-mode plan --verbose --dangerously-skip-permissions --output-format stream-json -p "/${AGENT_COMMAND} $CONTEXT_CONTENT" 2>&1 | tee "$AGENT_JSON_OUTPUT"
+          fi
+          AGENT_EXIT_CODE=${PIPESTATUS[0]}
+        else
+          # cc_plan expects plan agent with file path and line number
+          if [ "$AGENT_COMMAND" = "cc_plan" ]; then
+            codex exec -m "${CODEX_RUNNER_MODEL:-gpt-5.2-codex}" -s danger-full-access --enable web_search_request "Act as the plan agent. Org file: $ORG_FILE, Line: $AGENT_TASK_LINE" 2>&1 | tee "$AGENT_JSON_OUTPUT"
+          else
+            codex exec -m "${CODEX_RUNNER_MODEL:-gpt-5.2-codex}" -s danger-full-access --enable web_search_request "Act as the ${AGENT_COMMAND} agent. Context: $CONTEXT_CONTENT" 2>&1 | tee "$AGENT_JSON_OUTPUT"
+          fi
+          AGENT_EXIT_CODE=${PIPESTATUS[0]}
+        fi
+
+        set -e  # Re-enable exit on error
+
+        echo "$CURRENT_AGENT exit code: $AGENT_EXIT_CODE"
+
+        # Check for rate limit, API error, or timeout
+        SHOULD_SWITCH=false
+        if tail -1 "$AGENT_JSON_OUTPUT" | grep -qiE "hit.*limit.*try.*again.*in|error.*sending.*request.*for|timeout|timed.?out|context.*deadline.*exceeded"; then
+          echo "$CURRENT_AGENT hit rate limit, API error, or timeout"
+          SHOULD_SWITCH=true
+        elif [ "$AGENT_EXIT_CODE" -ne 0 ]; then
+          echo "$CURRENT_AGENT failed with exit code $AGENT_EXIT_CODE"
+          SHOULD_SWITCH=true
+        else
+          echo "✅ $CURRENT_AGENT execution succeeded"
+          AGENT_SUCCESS=true
+        fi
+
+        # If failed and more retries available, switch to the other agent
+        if [ "$SHOULD_SWITCH" = "true" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+          if [ "$CURRENT_AGENT" = "claude" ]; then
+            CURRENT_AGENT="codex"
+          else
+            CURRENT_AGENT="claude"
+          fi
+          # Exponential backoff: 2^retry_count seconds (2, 4, 8...)
+          SLEEP_TIME=$((2 ** RETRY_COUNT))
+          echo "Switching to $CURRENT_AGENT, waiting ${SLEEP_TIME}s before retry..."
+          sleep $SLEEP_TIME
+        fi
+      done
+
+      if [ "$AGENT_SUCCESS" = "false" ]; then
+        echo "❌ All $MAX_RETRIES attempts failed"
+      fi
+
+      echo "Agent execution completed (used: $USED_AGENT, success: $AGENT_SUCCESS)"
+
+      # Write result status for CI display
+      if [ "$AGENT_SUCCESS" = "true" ]; then
+        echo "success" > ci_result_status.txt
+      else
+        echo "failed" > ci_result_status.txt
+      fi
+
+      AGENT_REPORT="$REPO_PATH/agent_report.txt"
+      if [ "$AGENT_SUCCESS" = "true" ] && [ ! -f "$AGENT_REPORT" ]; then
+        echo "Agent was successful but did not generate a report. Generating a placeholder report."
+        if [ "$USED_AGENT" = "claude" ]; then
+          printf 'claude --permission-mode plan --verbose --dangerously-skip-permissions --output-format stream-json -p "/%s %s"' "$AGENT_COMMAND" "$CONTEXT_CONTENT" > "$AGENT_REPORT"
+        else
+          printf 'codex exec -m %s -s danger-full-access --enable web_search_request "Act as the %s agent. Context: %s"' "${CODEX_RUNNER_MODEL:-gpt-5.2-codex}" "$AGENT_COMMAND" "$CONTEXT_CONTENT" > "$AGENT_REPORT"
+        fi
+      fi
+
+      # Print agent_report.txt content if it exists
+      if [ -f "$AGENT_REPORT" ]; then
+        echo "=== Agent Report ==="
+        cat "$AGENT_REPORT"
+        echo "=== End of Agent Report ==="
+        # Call emacs function to complete org task and commit to complete branch
+        AGENT_REPORT_CONTENT=$(cat "$AGENT_REPORT")
+        if [ "$AGENT_COMMAND" = "cc_plan" ]; then
+          PLAN_JSON_PATH=$(grep -m1 '^Files:' "$AGENT_REPORT" | sed -E 's/^Files:[[:space:]]*//' | awk -F',' '{print $1}' | xargs)
+          if [ -z "$PLAN_JSON_PATH" ] && [ -d "$REPO_PATH/.carlos/.codex/plan_exports" ]; then
+            PLAN_JSON_PATH=$(find "$REPO_PATH/.carlos/.codex/plan_exports" -type f -name '*.json' -print0 | xargs -0 ls -t 2>/dev/null | head -n 1)
+          fi
+          if [ -n "$PLAN_JSON_PATH" ] && [ -f "$PLAN_JSON_PATH" ]; then
+            echo "Calling emacs to insert plan JSON: $PLAN_JSON_PATH"
+            PLAN_JSON_PATH_B64=$(printf '%s' "$PLAN_JSON_PATH" | base64 -w 0)
+            if emacs --batch --load ~/.emacs.d/init.el --load ~/carlos-spacemacs-config/layers/carlos/local/agent_workflow_tools.el \
+              --eval "(carlos/agent-insert-plan-json-to-org (base64-decode-string \"$PLAN_JSON_PATH_B64\"))"; then
+              echo "emacs agent-insert-plan-json-to-org succeeded"
+            else
+              echo "emacs agent-insert-plan-json-to-org failed"
+            fi
+          else
+            echo "Plan JSON not found; expected in agent_report or .carlos/.codex/plan_exports"
+          fi
+        fi
+        echo "Calling emacs to complete org task and commit..."
+        echo "  ORG_FILE: $ORG_FILE"
+        echo "  AGENT_TASK_LINE: $AGENT_TASK_LINE"
+        echo "  AGENT_TASK_TITLE: $AGENT_TASK_TITLE"
+        echo "  CODING_BRANCH_NAME: $CODING_BRANCH_NAME"
+        echo "  TASK_START_TIME: ${TASK_START_TIME:-not set}"
+        # Construct agent info: <agent>/<command> (e.g., claude/cc_org_agent_workflow)
+        AGENT_INFO="${USED_AGENT}/${AGENT_COMMAND}"
+        echo "  AGENT_INFO: $AGENT_INFO"
+        # Base64 encode all string variables to avoid shell string splitting issues with spaces
+        ORG_FILE_B64=$(printf '%s' "$ORG_FILE" | base64 -w 0)
+        AGENT_REPORT_CONTENT_B64=$(printf '%s' "$AGENT_REPORT_CONTENT" | base64 -w 0)
+        COMMIT_MSG_B64=$(printf '%s' "chore: complete $AGENT_TASK_TITLE" | base64 -w 0)
+        CODING_BRANCH_NAME_B64=$(printf '%s' "$CODING_BRANCH_NAME" | base64 -w 0)
+        AGENT_INFO_B64=$(printf '%s' "$AGENT_INFO" | base64 -w 0)
+        echo "  ORG_FILE_B64: $ORG_FILE_B64"
+        echo "  CODING_BRANCH_NAME_B64: $CODING_BRANCH_NAME_B64"
+        echo "  CI_PIPELINE_ID: ${CI_PIPELINE_ID:-not set}"
+        echo "  AGENT_INFO_B64: $AGENT_INFO_B64"
+        # Pass start time, pipeline-id, and agent-info to emacs function
+        if emacs --batch --load ~/.emacs.d/init.el --load ~/carlos-spacemacs-config/layers/carlos/local/agent_workflow_tools.el --eval "(carlos/agent-complete-org-task-and-commit \"$ORG_FILE_B64\" \"$AGENT_TASK_LINE\" \"$AGENT_REPORT_CONTENT_B64\" \"PENDING\" \"$COMMIT_MSG_B64\" t \"$CODING_BRANCH_NAME_B64\" ${TASK_START_TIME:-nil} \"${CI_PIPELINE_ID:-}\" \"$AGENT_INFO_B64\")"; then
+          echo "emacs agent-complete-org-task-and-commit succeeded"
+        else
+          echo "emacs agent-complete-org-task-and-commit failed"
+        fi
+        # Note: Branch cleanup moved outside this block to ensure cleanup always runs
+      else
+        echo "agent_report.txt not found at $AGENT_REPORT"
+        # Create fail branch before cleanup to prevent infinite loop
+        # This ensures the task won't be picked up again in subsequent runs
+        if [ -n "$CODING_BRANCH_NAME" ]; then
+          echo "Creating fail branch before cleanup..."
+          REPO_PATH_FAIL_B64=$(printf '%s' "$REPO_PATH" | base64 -w 0)
+          CODING_BRANCH_NAME_FAIL_B64=$(printf '%s' "$CODING_BRANCH_NAME" | base64 -w 0)
+          echo "  REPO_PATH_FAIL_B64: $REPO_PATH_FAIL_B64"
+          echo "  CODING_BRANCH_NAME_FAIL_B64: $CODING_BRANCH_NAME_FAIL_B64"
+          echo "  CI_PIPELINE_ID: ${CI_PIPELINE_ID:-not set}"
+          if emacs --batch --load ~/.emacs.d/init.el --load ~/carlos-spacemacs-config/layers/carlos/local/agent_workflow_tools.el --eval "(carlos/create-and-push-fail-branch \"$REPO_PATH_FAIL_B64\" \"$CODING_BRANCH_NAME_FAIL_B64\" \"${CI_PIPELINE_ID:-}\" t)"; then
+            echo "Fail branch created successfully"
+          else
+            echo "Failed to create fail branch (non-fatal)"
+          fi
+        fi
+      fi
+
+      # Always cleanup ai_flow/ and coding/ai_flow/ branches (regardless of success/failure)
+      # This ensures branches are cleaned up even when agent fails to produce agent_report.txt
+      if [ -n "$CODING_BRANCH_NAME" ]; then
+        echo "Cleaning up ai_flow branches (final cleanup)..."
+        echo "  CODING_BRANCH_NAME: $CODING_BRANCH_NAME"
+        # Base64 encode parameters for cleanup function
+        REPO_PATH_B64=$(printf '%s' "$REPO_PATH" | base64 -w 0)
+        CODING_BRANCH_NAME_CLEANUP_B64=$(printf '%s' "$CODING_BRANCH_NAME" | base64 -w 0)
+        echo "  REPO_PATH_B64: $REPO_PATH_B64"
+        echo "  CODING_BRANCH_NAME_CLEANUP_B64: $CODING_BRANCH_NAME_CLEANUP_B64"
+        if emacs --batch --load ~/.emacs.d/init.el --load ~/carlos-spacemacs-config/layers/carlos/local/agent_workflow_tools.el --eval "(carlos/cleanup-ai-flow-branches \"$REPO_PATH_B64\" \"$CODING_BRANCH_NAME_CLEANUP_B64\" t)"; then
+          echo "Branch cleanup succeeded"
+        else
+          echo "Branch cleanup failed (non-fatal)"
+        fi
+      else
+        echo "No CODING_BRANCH_NAME available for cleanup, skipping"
+      fi
+  artifacts:
+    paths:
+      - agent_report.txt
+      - ci_result_status.txt
+    when: always
+    expire_in: 24 hours
+
+# Sync all branches to Gitea except AI-related branches
+# Filtered out branches: ai/*, complete/*, fail/*, coding/*, todo/*, ai_flow/*
+# This job runs independently without depending on use_agent_to_code
+sync_branches_to_gitea:
+  stage: sync_agent_result
+  tags:
+    - linux
+  rules:
+    # Exclude scheduled pipelines
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    # Exclude agent iteration mode to prevent repeated pushes during scheduled runs
+    - if: $CARLOS_RUN_MODE == "agent-iter"
+      when: never
+    # Exclude AI-related branch patterns
+    - if: $CI_COMMIT_BRANCH =~ /^ai\/.*/
+      when: never
+    - if: $CI_COMMIT_BRANCH =~ /^complete\/.*/
+      when: never
+    - if: $CI_COMMIT_BRANCH =~ /^fail\/.*/
+      when: never
+    - if: $CI_COMMIT_BRANCH =~ /^coding\/.*/
+      when: never
+    - if: $CI_COMMIT_BRANCH =~ /^todo\/.*/
+      when: never
+    - if: $CI_COMMIT_BRANCH =~ /^ai_flow\/.*/
+      when: never
+    # Run on all other branches
+    - if: $CI_COMMIT_BRANCH
+      when: always
+  before_script:
+    - |
+      # Configure git user identity
+      git config user.name "carlos_code_agent"
+      git config user.email "huaixian.huang+codeagent@gmail.com"
+    - |
+      # Load environment variables from .bash_env (contains GITEA_URL and GITEA_TOKEN)
+      if [ -f /home/gitlab-runner/.bash_env ]; then
+        echo "Loading environment variables from /home/gitlab-runner/.bash_env"
+        source /home/gitlab-runner/.bash_env
+      else
+        echo "Warning: /home/gitlab-runner/.bash_env not found"
+      fi
+    - |
+      # Setup origin_gitea remote for carlosnas.lejuhub.com
+      ORIGIN_URL=$(git remote get-url origin)
+      echo "Current origin URL: $ORIGIN_URL"
+
+      # Extract repository name from origin URL (last path component without .git)
+      REPO_NAME=$(basename "$ORIGIN_URL" .git)
+      echo "Repository name: $REPO_NAME"
+
+      # Expected URL for origin_gitea
+      GITEA_SSH_URL="ssh://git@carlosnas.lejuhub.com:10022/carlos/${REPO_NAME}.git"
+
+      # Check if Gitea repository exists using API, create if not
+      if [ -n "$GITEA_URL" ] && [ -n "$GITEA_TOKEN" ]; then
+        echo "Checking if repository exists on Gitea..."
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+          -H "Authorization: token $GITEA_TOKEN" \
+          "${GITEA_URL}/api/v1/repos/carlos/${REPO_NAME}")
+
+        if [ "$HTTP_STATUS" = "404" ]; then
+          echo "Repository not found on Gitea, creating it..."
+          CREATE_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token $GITEA_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\": \"${REPO_NAME}\", \"private\": false, \"auto_init\": false}" \
+            "${GITEA_URL}/api/v1/user/repos")
+
+          if echo "$CREATE_RESPONSE" | grep -q "\"name\":\"${REPO_NAME}\""; then
+            echo "Successfully created repository: ${REPO_NAME}"
+          else
+            echo "Warning: Failed to create repository on Gitea"
+            echo "Response: $CREATE_RESPONSE"
+          fi
+        elif [ "$HTTP_STATUS" = "200" ]; then
+          echo "Repository already exists on Gitea"
+        else
+          echo "Warning: Unexpected HTTP status $HTTP_STATUS when checking Gitea repository"
+        fi
+      else
+        echo "Warning: GITEA_URL or GITEA_TOKEN not set, skipping repository check"
+      fi
+
+      if ! git remote get-url origin_gitea &>/dev/null; then
+        echo "origin_gitea remote not found, adding it..."
+        echo "Adding origin_gitea remote with URL: $GITEA_SSH_URL"
+        git remote add origin_gitea "$GITEA_SSH_URL"
+
+        # Fetch from origin_gitea to ensure it's working
+        echo "Fetching from origin_gitea..."
+        git fetch origin_gitea || echo "Warning: Failed to fetch from origin_gitea, will try to push anyway"
+      else
+        # Check if existing URL matches expected
+        EXISTING_GITEA_URL=$(git remote get-url origin_gitea)
+        if [ "$EXISTING_GITEA_URL" != "$GITEA_SSH_URL" ]; then
+          echo "origin_gitea URL mismatch. Expected: $GITEA_SSH_URL, Got: $EXISTING_GITEA_URL"
+          echo "Removing and recreating origin_gitea remote..."
+          git remote remove origin_gitea
+          git remote add origin_gitea "$GITEA_SSH_URL"
+          git fetch origin_gitea || echo "Warning: Failed to fetch from origin_gitea"
+        else
+          echo "origin_gitea remote already exists with correct URL: $EXISTING_GITEA_URL"
+        fi
+      fi
+  script:
+    - |
+      # Sync the current branch to Gitea
+      echo "Syncing branch to Gitea: $CI_COMMIT_BRANCH"
+
+      # Push current branch to Gitea with retry logic
+      RETRY_COUNT=0
+      MAX_RETRIES=3
+      while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+        if git push origin_gitea "HEAD:refs/heads/$CI_COMMIT_BRANCH" --force; then
+          echo "Successfully synced branch to Gitea: $CI_COMMIT_BRANCH"
+          break
+        else
+          RETRY_COUNT=$((RETRY_COUNT + 1))
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "Failed to sync branch to Gitea after $MAX_RETRIES attempts"
+          else
+            SLEEP_TIME=$((2 ** RETRY_COUNT))
+            echo "Push failed (attempt $RETRY_COUNT/$MAX_RETRIES), retrying in $SLEEP_TIME seconds..."
+            sleep $SLEEP_TIME
+          fi
+        fi
+      done
+    - echo "Gitea sync completed"
+
+# Cleanup job that always runs
+cleanup:
+  stage: cleanup
+  tags:
+    - linux
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH =~ /^carlos\/ai\/.*/
+      when: always
+    - if: $CI_COMMIT_BRANCH =~ /^ai\/.*/
+      when: always
+  script:
+    - echo "Running cleanup..."
+    - |
+      # Debug: Check ENV_FILE at start of cleanup job
+      echo "========== DEBUG: ENV_FILE at cleanup job start =========="
+      echo "ENV_FILE path: $ENV_FILE"
+      echo "ENV_FILE exists: $(test -f "$ENV_FILE" && echo 'YES' || echo 'NO')"
+      if [ -f "$ENV_FILE" ]; then
+        echo "ENV_FILE contents:"
+        cat "$ENV_FILE"
+      fi
+      echo "==========================================================="
+    - |
+      # Clean up old JSON log files older than 1 day
+      echo "Cleaning up old JSON log files in /tmp..."
+      find /tmp -name "gitlab_*.json" -type f -mtime +1 -delete 2>/dev/null || true
+      echo "Old log cleanup completed"
+    - |
+      # Clean up environment files
+      echo "Cleaning up environment files..."
+      if [ -f "$ENV_FILE" ]; then
+        rm -f "$ENV_FILE"
+        echo "Removed $ENV_FILE"
+      fi
+    - |
+      # Clean up old env files older than 1 day
+      if [ -d "$ENV_FILE_DIR" ]; then
+        echo "Cleaning up old env files in $ENV_FILE_DIR..."
+        find "$ENV_FILE_DIR" -name ".env_gitlab*" -type f -mtime +1 -delete 2>/dev/null || true
+        echo "Old env file cleanup completed"
+      fi
+    - echo "Cleanup completed"
+
+# Sync all branches to Gitea - runs on all branches except excluded prefixes
+# Excluded branches: ai/*, complete/gitlab-ci*, fail/gitlab-ci*, coding/gitlab-ci*
+sync_to_gitea:
+  stage: sync
+  tags:
+    - linux
+    # 增加一个规则，过滤掉 ai_flow/ 开头的分支 todo
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH =~ /^ai\/.*/
+      when: never
+    - if: $CI_COMMIT_BRANCH =~ /^complete\/.*/
+      when: never
+    - if: $CI_COMMIT_BRANCH =~ /^coding\/.*/
+      when: never
+    - if: $CI_COMMIT_BRANCH =~ /^fail\/.*/
+      when: never
+  before_script:
+    - |
+      # Configure git user identity
+      git config user.name "carlos_code_agent"
+      git config user.email "huaixian.huang+codeagent@gmail.com"
+    - |
+      # Load environment variables from .bash_env (contains GITEA_URL and GITEA_TOKEN)
+      if [ -f /home/gitlab-runner/.bash_env ]; then
+        echo "Loading environment variables from /home/gitlab-runner/.bash_env"
+        source /home/gitlab-runner/.bash_env
+      else
+        echo "Warning: /home/gitlab-runner/.bash_env not found"
+      fi
+    - |
+      echo "Test PATH"
+      echo "PATH is $PATH"
+      # Setup origin_gitea remote
+      ORIGIN_URL=$(git remote get-url origin)
+      echo "Current origin URL: $ORIGIN_URL"
+
+      # Extract repository name from origin URL (last path component without .git)
+      REPO_NAME=$(basename "$ORIGIN_URL" .git)
+      echo "Repository name: $REPO_NAME"
+
+      # Expected URL for origin_gitea
+      GITEA_SSH_URL="ssh://git@carlosnas.lejuhub.com:10022/carlos/${REPO_NAME}.git"
+
+      # Check if Gitea repository exists using API, create if not
+      if [ -n "$GITEA_URL" ] && [ -n "$GITEA_TOKEN" ]; then
+        echo "Checking if repository exists on Gitea..."
+        # Query Gitea API to check if repository exists
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+          -H "Authorization: token $GITEA_TOKEN" \
+          "${GITEA_URL}/api/v1/repos/carlos/${REPO_NAME}")
+
+        if [ "$HTTP_STATUS" = "404" ]; then
+          echo "Repository not found on Gitea, creating it..."
+          # Create repository via Gitea API
+          CREATE_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token $GITEA_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\": \"${REPO_NAME}\", \"private\": false, \"auto_init\": false}" \
+            "${GITEA_URL}/api/v1/user/repos")
+
+          if echo "$CREATE_RESPONSE" | grep -q "\"name\":\"${REPO_NAME}\""; then
+            echo "Successfully created repository: ${REPO_NAME}"
+          else
+            echo "Warning: Failed to create repository on Gitea"
+            echo "Response: $CREATE_RESPONSE"
+          fi
+        elif [ "$HTTP_STATUS" = "200" ]; then
+          echo "Repository already exists on Gitea"
+        else
+          echo "Warning: Unexpected HTTP status $HTTP_STATUS when checking Gitea repository"
+        fi
+      else
+        echo "Warning: GITEA_URL or GITEA_TOKEN not set, skipping repository check"
+      fi
+
+      if ! git remote get-url origin_gitea &>/dev/null; then
+        echo "origin_gitea remote not found, adding it..."
+        echo "Adding origin_gitea remote with URL: $GITEA_SSH_URL"
+        git remote add origin_gitea "$GITEA_SSH_URL"
+      else
+        # Check if existing URL matches expected
+        EXISTING_GITEA_URL=$(git remote get-url origin_gitea)
+        if [ "$EXISTING_GITEA_URL" != "$GITEA_SSH_URL" ]; then
+          echo "origin_gitea URL mismatch. Expected: $GITEA_SSH_URL, Got: $EXISTING_GITEA_URL"
+          echo "Removing and recreating origin_gitea remote..."
+          git remote remove origin_gitea
+          git remote add origin_gitea "$GITEA_SSH_URL"
+        else
+          echo "origin_gitea remote already exists with correct URL: $EXISTING_GITEA_URL"
+        fi
+      fi
+  script:
+    - |
+      echo "Syncing branch $CI_COMMIT_BRANCH to Gitea..."
+
+      # Fetch latest from origin to ensure we have all refs
+      git fetch origin --prune || echo "Warning: Failed to fetch from origin"
+
+      # Push current branch to Gitea
+      echo "Pushing $CI_COMMIT_BRANCH to origin_gitea..."
+
+      RETRY_COUNT=0
+      MAX_RETRIES=3
+      while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+        if git push origin_gitea "HEAD:refs/heads/$CI_COMMIT_BRANCH" --force; then
+          echo "Successfully synced $CI_COMMIT_BRANCH to Gitea"
+          break
+        else
+          RETRY_COUNT=$((RETRY_COUNT + 1))
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "Failed to sync to Gitea after $MAX_RETRIES attempts"
+            exit 1
+          fi
+          SLEEP_TIME=$((2 ** RETRY_COUNT))
+          echo "Push failed (attempt $RETRY_COUNT/$MAX_RETRIES), retrying in $SLEEP_TIME seconds..."
+          sleep $SLEEP_TIME
+        fi
+      done
+    - echo "Gitea sync completed"
+
+
+use_agent_failover:
+  stage: cleanup
+  needs:
+    - job: use_agent_to_code
+      optional: true
+  tags:
+    - linux
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH =~ /^carlos\/ai\/.*/
+      when: on_failure
+    - if: $CI_COMMIT_BRANCH =~ /^ai\/.*/
+      when: on_failure
+  script:
+    - echo "use_agent_to_code failed; attempting proxy switch and failure branch push"
+    - clash_auto_update_select_proxies.py r5c.carlos.codecola.uk --threshold 200 || echo "Proxy switch command failed"
+    - |
+      git config user.name "carlos_code_agent"
+      git config user.email "huaixian.huang+codeagent@gmail.com"
+    - |
+      ORIGIN_URL=$(git remote get-url origin)
+      REPO_NAME=$(basename "$ORIGIN_URL" .git)
+      SSH_URL="ssh://git@${CI_SERVER_HOST}:10022/${CI_PROJECT_PATH}.git"
+
+      if ! git remote get-url origin_ssh &>/dev/null; then
+        echo "origin_ssh remote not found, adding it..."
+        git remote add origin_ssh "$SSH_URL"
+      else
+        EXISTING_SSH_URL=$(git remote get-url origin_ssh)
+        if [ "$EXISTING_SSH_URL" != "$SSH_URL" ]; then
+          echo "origin_ssh URL mismatch. Expected: $SSH_URL, Got: $EXISTING_SSH_URL"
+          echo "Recreating origin_ssh remote..."
+          git remote remove origin_ssh
+          git remote add origin_ssh "$SSH_URL"
+        fi
+      fi
+
+      echo "Fetching from origin_ssh..."
+      git fetch origin_ssh || echo "Warning: Failed to fetch from origin_ssh"
+    - |
+      FAILURE_BRANCH="${FAIL_BRANCH_PREFIX}/fail/${CI_COMMIT_BRANCH}_${SHA_SHORT}"
+      echo "Pushing CI commit $CI_COMMIT_SHA to failure branch: $FAILURE_BRANCH"
+
+      RETRY_COUNT=0
+      MAX_RETRIES=3
+      while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+        if git push origin_ssh "$CI_COMMIT_SHA:refs/heads/$FAILURE_BRANCH" --force; then
+          echo "Successfully pushed failure branch: $FAILURE_BRANCH"
+          break
+        else
+          RETRY_COUNT=$((RETRY_COUNT + 1))
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "Failed to push failure branch after $MAX_RETRIES attempts"
+            exit 1
+          fi
+          SLEEP_TIME=$((2 ** RETRY_COUNT))
+          echo "Push failed (attempt $RETRY_COUNT/$MAX_RETRIES), retrying in $SLEEP_TIME seconds..."
+          sleep $SLEEP_TIME
+        fi
+      done
+    - |
+      # Cleanup ai_flow/ and coding/ai_flow/ branches after failure
+      # Try to read CODING_BRANCH_NAME from context file if available
+      REPO_PATH="$(pwd)"
+      CONTEXT_FILE="context_for_agent.txt"
+      CODING_BRANCH_NAME=""
+
+      if [ -f "$REPO_PATH/$CONTEXT_FILE" ]; then
+        CODING_BRANCH_NAME=$(sed -n '2p' "$REPO_PATH/$CONTEXT_FILE" 2>/dev/null | tr -d '\r')
+      fi
+
+      # Fallback: derive from CI_COMMIT_BRANCH if it matches coding/ai_flow pattern
+      if [ -z "$CODING_BRANCH_NAME" ] && echo "$CI_COMMIT_BRANCH" | grep -qE "^coding/ai_flow/"; then
+        CODING_BRANCH_NAME="$CI_COMMIT_BRANCH"
+      fi
+
+      if [ -n "$CODING_BRANCH_NAME" ]; then
+        echo "Cleaning up ai_flow branches (failure cleanup)..."
+        echo "  CODING_BRANCH_NAME: $CODING_BRANCH_NAME"
+        if emacs --batch --load ~/.emacs.d/init.el --load ~/carlos-spacemacs-config/layers/carlos/local/agent_workflow_tools.el --eval "(carlos/cleanup-ai-flow-branches \"$REPO_PATH\" \"$CODING_BRANCH_NAME\" t)"; then
+          echo "Branch cleanup succeeded"
+        else
+          echo "Branch cleanup failed (non-fatal)"
+        fi
+      else
+        echo "No CODING_BRANCH_NAME available for cleanup, skipping"
+      fi
+
+# Failover job for execute_ai_agent - runs when AI execution fails during scheduled/agent-iter pipelines
+execute_ai_agent_failover:
+  stage: cleanup
+  needs:
+    - job: execute_ai_agent
+      optional: true
+  tags:
+    - linux
+  rules:
+    # Only trigger on failure during scheduled pipelines
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: on_failure
+    # Only trigger on failure during agent-iter mode
+    - if: $CARLOS_RUN_MODE == "agent-iter"
+      when: on_failure
+  script:
+    - echo "execute_ai_agent failed; attempting cleanup and failure branch push"
+    - clash_auto_update_select_proxies.py r5c.carlos.codecola.uk --threshold 200 || echo "Proxy switch command failed"
+    - |
+      git config user.name "carlos_code_agent"
+      git config user.email "huaixian.huang+codeagent@gmail.com"
+    - |
+      ORIGIN_URL=$(git remote get-url origin)
+      REPO_NAME=$(basename "$ORIGIN_URL" .git)
+      SSH_URL="ssh://git@${CI_SERVER_HOST}:10022/${CI_PROJECT_PATH}.git"
+
+      if ! git remote get-url origin_ssh &>/dev/null; then
+        echo "origin_ssh remote not found, adding it..."
+        git remote add origin_ssh "$SSH_URL"
+      else
+        EXISTING_SSH_URL=$(git remote get-url origin_ssh)
+        if [ "$EXISTING_SSH_URL" != "$SSH_URL" ]; then
+          echo "origin_ssh URL mismatch. Expected: $SSH_URL, Got: $EXISTING_SSH_URL"
+          echo "Recreating origin_ssh remote..."
+          git remote remove origin_ssh
+          git remote add origin_ssh "$SSH_URL"
+        fi
+      fi
+
+      echo "Fetching from origin_ssh..."
+      git fetch origin_ssh || echo "Warning: Failed to fetch from origin_ssh"
+    - |
+      # Cleanup ai_flow/ and coding/ai_flow/ branches after failure
+      REPO_PATH="$(pwd)"
+      CONTEXT_FILE="context_for_agent.txt"
+      CODING_BRANCH_NAME=""
+
+      if [ -f "$REPO_PATH/$CONTEXT_FILE" ]; then
+        CODING_BRANCH_NAME=$(sed -n '2p' "$REPO_PATH/$CONTEXT_FILE" 2>/dev/null | tr -d '\r')
+      fi
+
+      if [ -n "$CODING_BRANCH_NAME" ]; then
+        echo "Cleaning up ai_flow branches (execute_ai_agent failure)..."
+        echo "  CODING_BRANCH_NAME: $CODING_BRANCH_NAME"
+        if emacs --batch --load ~/.emacs.d/init.el --load ~/carlos-spacemacs-config/layers/carlos/local/agent_workflow_tools.el --eval "(carlos/cleanup-ai-flow-branches \"$REPO_PATH\" \"$CODING_BRANCH_NAME\" t)"; then
+          echo "Branch cleanup succeeded"
+        else
+          echo "Branch cleanup failed (non-fatal)"
+        fi
+      else
+        echo "No CODING_BRANCH_NAME available for cleanup, skipping"
+      fi
+    - echo "failed" > ci_result_status.txt
+  artifacts:
+    paths:
+      - ci_result_status.txt
+    when: always
+    expire_in: 24 hours
+
+# Cleanup branches for org headings marked as DONE or PENDING
+# This job runs on master/main pushes and cleans up complete/, fail/, coding/, ai_flow/ branches
+# for headings that have been marked as completed in the org file
+cleanup_completed_heading_branches:
+  stage: cleanup
+  tags:
+    - linux
+  rules:
+    # Only run on master/main branch pushes (not scheduled or other triggers)
+    - if: '$CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main")'
+      when: always
+  before_script:
+    - |
+      # Load environment variables from .bash_env
+      if [ -f /home/gitlab-runner/.bash_env ]; then
+        echo "Loading environment variables from /home/gitlab-runner/.bash_env"
+        source /home/gitlab-runner/.bash_env
+      else
+        echo "Warning: /home/gitlab-runner/.bash_env not found"
+      fi
+    - |
+      # Configure git user identity
+      git config user.name "carlos_code_agent"
+      git config user.email "huaixian.huang+codeagent@gmail.com"
+    - |
+      # Setup origin_ssh remote for branch deletion
+      SSH_URL="ssh://git@${CI_SERVER_HOST}:10022/${CI_PROJECT_PATH}.git"
+      if ! git remote get-url origin_ssh &>/dev/null; then
+        echo "Adding origin_ssh remote..."
+        git remote add origin_ssh "$SSH_URL"
+      fi
+      git fetch origin_ssh --prune || echo "Warning: Failed to fetch from origin_ssh"
+  script:
+    - echo "Cleaning up branches for completed org headings..."
+    - |
+      # Helper for sending error notification from CI (only for unexpected crashes)
+      send_error_notification() {
+        local text="$1"
+        if [ -n "$PUSHDEER_URL" ] && [ -n "$PUSHDEER_TOKEN" ]; then
+          curl -s -o /dev/null -m 10 \
+            -d "text=${text}&pushkey=${PUSHDEER_TOKEN}" \
+            -H "Content-type: application/x-www-form-urlencoded" \
+            "$PUSHDEER_URL" || true
+        fi
+      }
+
+      REPO_PATH="$(pwd)"
+      REPO_PATH_B64=$(printf '%s' "$REPO_PATH" | base64 -w 0)
+
+      # Use HEAD~1 as base reference to find changes in this push
+      BASE_REF="HEAD~1"
+
+      # Encode PushDeer parameters as base64
+      PUSHDEER_URL_B64=""
+      PUSHDEER_TOKEN_B64=""
+      if [ -n "$PUSHDEER_URL" ]; then
+        PUSHDEER_URL_B64=$(printf '%s' "$PUSHDEER_URL" | base64 -w 0)
+      fi
+      if [ -n "$PUSHDEER_TOKEN" ]; then
+        PUSHDEER_TOKEN_B64=$(printf '%s' "$PUSHDEER_TOKEN" | base64 -w 0)
+      fi
+
+      # Check if merged branch cleanup notification is enabled (default: disabled)
+      # Set NOTIFY_MERGED_BRANCH_CLEANUP=true to enable notifications for merged complete/ branches
+      NOTIFY_MERGED="${NOTIFY_MERGED_BRANCH_CLEANUP:-false}"
+      echo "Merged branch cleanup notification: $NOTIFY_MERGED"
+
+      # Encode CI_COMMIT_BRANCH as base64 (for detached HEAD detection in CI)
+      CI_BRANCH_B64=""
+      if [ -n "$CI_COMMIT_BRANCH" ]; then
+        CI_BRANCH_B64=$(printf '%s' "$CI_COMMIT_BRANCH" | base64 -w 0)
+      elif [ -n "$CI_COMMIT_REF_NAME" ]; then
+        CI_BRANCH_B64=$(printf '%s' "$CI_COMMIT_REF_NAME" | base64 -w 0)
+      elif [ -n "$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME" ]; then
+        CI_BRANCH_B64=$(printf '%s' "$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME" | base64 -w 0)
+      fi
+
+      echo "Repository path: $REPO_PATH"
+      echo "Base reference: $BASE_REF"
+      echo "CI branch: $CI_COMMIT_BRANCH"
+      echo "PushDeer URL configured: $([ -n "$PUSHDEER_URL_B64" ] && echo 'yes' || echo 'no')"
+      echo "PushDeer Token configured: $([ -n "$PUSHDEER_TOKEN_B64" ] && echo 'yes' || echo 'no')"
+
+      # Output file for emacs results (emacs writes to this file)
+      CLEANUP_OUTPUT_FILE="cleanup_batch_output.txt"
+      rm -f "$CLEANUP_OUTPUT_FILE"
+
+      if emacs --batch --load ~/.emacs.d/init.el --load ~/carlos-spacemacs-config/layers/carlos/local/agent_workflow_tools.el --eval "(carlos/cleanup-merged-branches-only-batch \"$REPO_PATH_B64\" \"$PUSHDEER_URL_B64\" \"$PUSHDEER_TOKEN_B64\" t \"$NOTIFY_MERGED\" \"$CI_BRANCH_B64\")"; then
+        EMACS_EXIT=0
+      else
+        EMACS_EXIT=$?
+      fi
+
+      echo "emacs exit code: $EMACS_EXIT"
+
+      # Read output from file written by emacs
+      echo "=== Cleanup Output File ==="
+      if [ -f "$CLEANUP_OUTPUT_FILE" ]; then
+        cat "$CLEANUP_OUTPUT_FILE"
+      else
+        echo "Warning: output file $CLEANUP_OUTPUT_FILE not found"
+      fi
+      echo "=== End Cleanup Output File ==="
+
+      if [ "$EMACS_EXIT" -eq 0 ]; then
+        echo "Branch cleanup succeeded"
+      elif [ "$EMACS_EXIT" -eq 1 ]; then
+        echo "No branches to clean up - job will fail as expected"
+        exit 1
+      else
+        echo "Branch cleanup failed with unexpected error (exit code: $EMACS_EXIT)"
+        send_error_notification "❌ cleanup_completed_heading_branches 失败 (exit: $EMACS_EXIT)，请检查日志"
+        exit "$EMACS_EXIT"
+      fi
+    - echo "Completed heading branch cleanup finished"
+
+# Auto-merge complete branches to master/main
+# This job runs on schedule to merge pending complete/ branches
+# that are ready to be merged without conflicts
+#
+# Environment variables:
+#   CARLOS_AUTO_MERGE_DEBUG: Set to '1', 'true', or 'yes' to enable verbose debug output
+#                            Useful for troubleshooting auto-merge issues
+#   NOTIFY_AUTO_MERGE_START: Set to 'true' to enable PushDeer notification when merge starts
+#   NOTIFY_AUTO_MERGE_CONFLICT: Set to 'true' to enable PushDeer notification on merge conflict
+#   NOTIFY_AUTO_MERGE_SUCCESS: Set to 'true' to enable PushDeer notification on merge success
+auto_merge_complete_branches:
+  stage: auto_merge
+  tags:
+    - linux
+  rules:
+    # Run on agent-iter mode or scheduled pipelines, only on master or main branch
+    - if: '($CARLOS_RUN_MODE == "agent-iter" || $CI_PIPELINE_SOURCE == "schedule") && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main")'
+      when: always
+  before_script:
+    - |
+      # Load environment variables from .bash_env
+      if [ -f /home/gitlab-runner/.bash_env ]; then
+        echo "Loading environment variables from /home/gitlab-runner/.bash_env"
+        source /home/gitlab-runner/.bash_env
+      else
+        echo "Warning: /home/gitlab-runner/.bash_env not found"
+      fi
+    - |
+      # Configure git user identity
+      git config user.name "carlos_code_agent"
+      git config user.email "huaixian.huang+codeagent@gmail.com"
+    - |
+      # Setup origin_ssh remote for push
+      SSH_URL="ssh://git@${CI_SERVER_HOST}:10022/${CI_PROJECT_PATH}.git"
+      if ! git remote get-url origin_ssh &>/dev/null; then
+        echo "Adding origin_ssh remote..."
+        git remote add origin_ssh "$SSH_URL"
+      fi
+      git fetch origin_ssh --prune || echo "Warning: Failed to fetch from origin_ssh"
+    - |
+      # Checkout master or main branch
+      if git show-ref --verify --quiet refs/remotes/origin_ssh/master; then
+        echo "Checking out master branch"
+        git checkout -B master origin_ssh/master
+      elif git show-ref --verify --quiet refs/remotes/origin_ssh/main; then
+        echo "Checking out main branch"
+        git checkout -B main origin_ssh/main
+      else
+        echo "Error: Neither master nor main branch found"
+        exit 1
+      fi
+  script:
+    - echo "Auto-merging complete branches..."
+    - |
+      # Helper for sending error notification from CI
+      send_error_notification() {
+        local text="$1"
+        if [ -n "$PUSHDEER_URL" ] && [ -n "$PUSHDEER_TOKEN" ]; then
+          curl -s -o /dev/null -m 10 \
+            -d "text=${text}&pushkey=${PUSHDEER_TOKEN}" \
+            -H "Content-type: application/x-www-form-urlencoded" \
+            "$PUSHDEER_URL" || true
+        fi
+      }
+
+      REPO_PATH="$(pwd)"
+      REPO_PATH_B64=$(printf '%s' "$REPO_PATH" | base64 -w 0)
+
+      # Encode PushDeer parameters as base64
+      PUSHDEER_URL_B64=""
+      PUSHDEER_TOKEN_B64=""
+      if [ -n "$PUSHDEER_URL" ]; then
+        PUSHDEER_URL_B64=$(printf '%s' "$PUSHDEER_URL" | base64 -w 0)
+      fi
+      if [ -n "$PUSHDEER_TOKEN" ]; then
+        PUSHDEER_TOKEN_B64=$(printf '%s' "$PUSHDEER_TOKEN" | base64 -w 0)
+      fi
+
+      echo "Repository path: $REPO_PATH"
+      echo "PushDeer URL configured: $([ -n "$PUSHDEER_URL_B64" ] && echo 'yes' || echo 'no')"
+      echo "PushDeer Token configured: $([ -n "$PUSHDEER_TOKEN_B64" ] && echo 'yes' || echo 'no')"
+
+      # Convert notification toggles to Lisp booleans
+      NOTIFY_START_LISP="nil"
+      if [ "${NOTIFY_AUTO_MERGE_START:-false}" = "true" ]; then
+        NOTIFY_START_LISP="t"
+      fi
+      NOTIFY_CONFLICT_LISP="nil"
+      if [ "${NOTIFY_AUTO_MERGE_CONFLICT:-false}" = "true" ]; then
+        NOTIFY_CONFLICT_LISP="t"
+      fi
+      NOTIFY_SUCCESS_LISP="nil"
+      if [ "${NOTIFY_AUTO_MERGE_SUCCESS:-false}" = "true" ]; then
+        NOTIFY_SUCCESS_LISP="t"
+      fi
+      echo "Notify auto-merge start: $NOTIFY_START_LISP"
+      echo "Notify auto-merge conflict: $NOTIFY_CONFLICT_LISP"
+      echo "Notify auto-merge success: $NOTIFY_SUCCESS_LISP"
+
+      # Output file for emacs results
+      MERGE_OUTPUT_FILE="cleanup_batch_output.txt"
+      rm -f "$MERGE_OUTPUT_FILE"
+
+      # Run auto-merge batch function
+      if emacs --batch --load ~/.emacs.d/init.el --load ~/carlos-spacemacs-config/layers/carlos/local/agent_workflow_tools.el --eval "(carlos/auto-merge-complete-branches-batch \"$REPO_PATH_B64\" \"$PUSHDEER_URL_B64\" \"$PUSHDEER_TOKEN_B64\" t $NOTIFY_START_LISP $NOTIFY_CONFLICT_LISP $NOTIFY_SUCCESS_LISP)"; then
+        EMACS_EXIT=0
+      else
+        EMACS_EXIT=$?
+      fi
+
+      echo "emacs exit code: $EMACS_EXIT"
+
+      # Read output from file
+      echo "=== Auto-Merge Output File ==="
+      if [ -f "$MERGE_OUTPUT_FILE" ]; then
+        cat "$MERGE_OUTPUT_FILE"
+      else
+        echo "Warning: output file $MERGE_OUTPUT_FILE not found"
+      fi
+      echo "=== End Auto-Merge Output File ==="
+
+      if [ "$EMACS_EXIT" -eq 0 ]; then
+        echo "Auto-merge succeeded - at least one branch was merged"
+      elif [ "$EMACS_EXIT" -eq 1 ]; then
+        echo "No branches merged - job fails as required"
+        # Exit 1 when no branches merged (failure as per requirement)
+        exit 1
+      elif [ "$EMACS_EXIT" -eq 2 ]; then
+        echo "========================================"
+        echo "Detected merge conflict (exit code 2)"
+        echo "Will invoke claude code to resolve conflicts"
+        echo "========================================"
+        CONFLICT_BRANCHES=$(grep '^CONFLICT_BRANCHES:' "$MERGE_OUTPUT_FILE" | head -n 1 | cut -d':' -f2-)
+        if [ -z "$CONFLICT_BRANCHES" ]; then
+          echo "No conflict branches reported; marking failure"
+          exit 2
+        fi
+
+        CONTEXT_OUTPUT=$(emacs --batch --load ~/.emacs.d/init.el \
+          --load ~/carlos-spacemacs-config/layers/carlos/local/agent_workflow_tools.el \
+          --eval "(carlos/auto-merge-build-conflict-context-batch \"$REPO_PATH_B64\" \"$(printf '%s' "$CONFLICT_BRANCHES" | base64 -w 0)\" t)")
+        if [ -n "$CONTEXT_OUTPUT" ]; then
+          CLAUDE_COMMAND="/resolve_conflict $CONTEXT_OUTPUT"
+        else
+          CLAUDE_COMMAND="/resolve_conflict"
+          CLAUDE_COMMAND+="\n当前任务: 解决 org 文件的合并冲突"
+          CLAUDE_COMMAND+="\n工作目录: $REPO_PATH"
+          CLAUDE_COMMAND+="\n冲突分支: $CONFLICT_BRANCHES"
+        fi
+        CLAUDE_COMMAND+="\n注意: 仅解决冲突并保存文件，不要提交 (commit 由 Emacs 处理)"
+
+        CLAUDE_JSON_OUTPUT="/tmp/auto_merge_conflict_${CI_COMMIT_SHA}.json"
+        echo "Invoking Claude Code for conflict resolution..."
+        set +e
+        claude --permission-mode plan --verbose --dangerously-skip-permissions --output-format stream-json \
+          -p "$CLAUDE_COMMAND" 2>&1 | tee "$CLAUDE_JSON_OUTPUT"
+        CLAUDE_EXIT=${PIPESTATUS[0]}
+        set -e
+        echo "Claude exit code: $CLAUDE_EXIT"
+
+        python3 ./ci_scripts/parse_claude_code_result.py "$CLAUDE_JSON_OUTPUT"
+        PARSE_EXIT=$?
+        echo "Claude output parse exit: $PARSE_EXIT"
+        if [ "$CLAUDE_EXIT" -ne 0 ] || [ "$PARSE_EXIT" -ne 0 ]; then
+          echo "Claude conflict resolution failed"
+          exit 2
+        fi
+
+        FINALIZE_COMMIT_MSG="auto-merge: resolve org conflicts"
+        FINALIZE_MSG_B64=$(printf '%s' "$FINALIZE_COMMIT_MSG" | base64 -w 0)
+        if emacs --batch --load ~/.emacs.d/init.el --load ~/carlos-spacemacs-config/layers/carlos/local/agent_workflow_tools.el \
+          --eval "(carlos/auto-merge-finalize-conflict-batch \"$REPO_PATH_B64\" \"$FINALIZE_MSG_B64\" t)"; then
+          FINALIZE_EXIT=0
+        else
+          FINALIZE_EXIT=$?
+        fi
+
+        echo "Finalize merge exit: $FINALIZE_EXIT"
+        if [ "$FINALIZE_EXIT" -ne 0 ]; then
+          echo "Finalize merge failed"
+          exit 2
+        fi
+
+        TARGET_BRANCH="master"
+        if ! git show-ref --verify --quiet refs/heads/master; then
+          TARGET_BRANCH="main"
+        fi
+        echo "Pushing resolved merge to origin_ssh/$TARGET_BRANCH"
+        git push origin_ssh "$TARGET_BRANCH"
+        echo "Auto-merge conflict resolved successfully"
+      else
+        echo "Auto-merge failed with unexpected error (exit code: $EMACS_EXIT)"
+        send_error_notification "❌ auto_merge_complete_branches 失败 (exit: $EMACS_EXIT)，请检查日志"
+        exit "$EMACS_EXIT"
+      fi
+    - echo "Auto-merge complete branches finished"
