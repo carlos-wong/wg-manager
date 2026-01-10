@@ -1,0 +1,112 @@
+{
+  "version": "1.0",
+  "generated_at": "2026-01-10T14:00:00",
+  "source": {
+    "org_file": "wg-manager.org",
+    "line_number": 19,
+    "heading_title": "PLAN 在添加节点之前，从服务器拉取配置再添加新节点，防止有两边同时添加多个节点到服务器上导致 IP 冲突的问题。"
+  },
+  "parent_context": {
+    "parent": "PENDING 查看一下当前项目里面添加客户端节点的时候，有没有先跟服务器进行一次同步，还是只依赖本地的数据库？",
+    "grandparent": "TODO wg-manager"
+  },
+  "sub_plans": [
+    {
+      "title": "实现从远程服务器获取当前已用 IP 列表的方法",
+      "level": 4,
+      "todo_state": "TODO",
+      "properties": {
+        "CREATED": "[2026-01-10 Sat 14:00]"
+      },
+      "description": "在 ssh.py 中添加 get_used_ips_from_remote() 方法，通过 `wg show wg0 allowed-ips` 命令获取服务器上所有已分配的 IP 地址。",
+      "tags": [],
+      "children": []
+    },
+    {
+      "title": "在 manager.py 中添加远程 IP 同步逻辑",
+      "level": 4,
+      "todo_state": "TODO",
+      "properties": {
+        "CREATED": "[2026-01-10 Sat 14:00]"
+      },
+      "description": "创建 sync_used_ips_from_remote() 方法，调用远程获取方法并将结果合并到本地数据库的已用 IP 集合中。",
+      "tags": [],
+      "children": []
+    },
+    {
+      "title": "修改 _get_next_ip() 方法加入远程同步",
+      "level": 4,
+      "todo_state": "TODO",
+      "properties": {
+        "CREATED": "[2026-01-10 Sat 14:00]",
+        "DEPENDS_ON": "实现从远程服务器获取当前已用 IP 列表的方法, 在 manager.py 中添加远程 IP 同步逻辑"
+      },
+      "description": "在 manager.py:312-324 的 _get_next_ip() 方法中，调用 IP 分配前先从远程同步已用 IP。确保同时考虑本地数据库和远程服务器的 IP 占用情况。",
+      "tags": [],
+      "children": []
+    },
+    {
+      "title": "处理 SSH 未配置时的降级策略",
+      "level": 4,
+      "todo_state": "TODO",
+      "properties": {
+        "CREATED": "[2026-01-10 Sat 14:00]"
+      },
+      "description": "当 SSH 未配置或连接失败时，保持当前仅使用本地数据库的行为，但向用户发出警告提示存在潜在 IP 冲突风险。",
+      "tags": [],
+      "children": []
+    },
+    {
+      "title": "添加单元测试验证 IP 冲突预防逻辑",
+      "level": 4,
+      "todo_state": "TODO",
+      "properties": {
+        "CREATED": "[2026-01-10 Sat 14:00]",
+        "DEPENDS_ON": "修改 _get_next_ip() 方法加入远程同步"
+      },
+      "description": "编写测试用例：1) 模拟远程已有 IP 占用的场景；2) 验证分配的 IP 不与远程冲突；3) 测试 SSH 失败时的降级行为。",
+      "tags": [],
+      "children": []
+    },
+    {
+      "title": "更新用户文档说明新的同步机制",
+      "level": 4,
+      "todo_state": "TODO",
+      "properties": {
+        "CREATED": "[2026-01-10 Sat 14:00]",
+        "DEPENDS_ON": "添加单元测试验证 IP 冲突预防逻辑"
+      },
+      "description": "在 README.md 或相关文档中说明：添加节点时会自动从服务器同步 IP 使用情况，以及 SSH 未配置时的注意事项。",
+      "tags": [],
+      "children": []
+    }
+  ],
+  "parallelization_info": {
+    "parallel_tasks": [
+      "实现从远程服务器获取当前已用 IP 列表的方法",
+      "在 manager.py 中添加远程 IP 同步逻辑",
+      "处理 SSH 未配置时的降级策略"
+    ],
+    "dependent_tasks": [
+      {
+        "task": "修改 _get_next_ip() 方法加入远程同步",
+        "depends_on": [
+          "实现从远程服务器获取当前已用 IP 列表的方法",
+          "在 manager.py 中添加远程 IP 同步逻辑"
+        ]
+      },
+      {
+        "task": "添加单元测试验证 IP 冲突预防逻辑",
+        "depends_on": [
+          "修改 _get_next_ip() 方法加入远程同步"
+        ]
+      },
+      {
+        "task": "更新用户文档说明新的同步机制",
+        "depends_on": [
+          "添加单元测试验证 IP 冲突预防逻辑"
+        ]
+      }
+    ]
+  }
+}
