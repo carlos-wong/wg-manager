@@ -16,7 +16,438 @@ Deleted: None
 Files: reports/2026/01/10-client-sync-mechanism.md
 Notes: 研究完成 - 当前项目添加客户端时只依赖本地数据库分配IP，不会先从服务器同步，存在潜在的数据不一致风险
 
-*** PLAN 制定一个开发计划。在添加节点之前，从服务器拉取配置再添加新节点，防止有两边同时添加多个节点到服务器上导致 IP 冲突的问题。 
+*** PENDING 制定一个开发计划。在添加节点之前，从服务器拉取配置再添加新节点，防止有两边同时添加多个节点到服务器上导致 IP 冲突的问题。 
 :PROPERTIES:
 :CREATED:  [2026-01-10 Sat 13:48]
 :END:
+**** TODO 创建同步模块 (wg_manager/sync.py) :sync:core:
+:PROPERTIES:
+:ID: 8679f8cd-9d70-427d-bafb-84664f57648c
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+实现服务器配置同步和分布式锁机制的核心模块
+***** TODO 实现配置拉取功能
+:PROPERTIES:
+:ID: dd814ae8-f462-40e4-8e4b-519449eb9d4e
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+从远程服务器原子性读取WireGuard配置
+****** TODO 创建 sync.py 文件并添加模块导入
+:PROPERTIES:
+:ID: 5a6012a3-64e0-4762-9e1d-e0c03064d8ea
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+创建新文件，导入 SSHClient, typing, logging 等依赖
+****** TODO 实现 pull_latest_config() 函数
+:PROPERTIES:
+:ID: 3c8a5aae-d457-4965-9762-e34b8c0ad3c0
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+通过SSH读取远程配置文件内容并返回字符串
+****** TODO 实现 validate_config_format() 函数
+:PROPERTIES:
+:ID: 65084a23-7f98-4b87-a402-3ca6a6f2165c
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+验证配置格式是否完整，检查[Interface]和[Peer]结构
+***** TODO 实现分布式锁机制
+:PROPERTIES:
+:ID: 6fd51a81-5627-43a8-89a7-808b16be0d7f
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+基于文件锁的并发控制机制
+****** TODO 实现 acquire_lock() 函数
+:PROPERTIES:
+:ID: 80a410e0-e8fa-47a7-aedd-d82b7fd0b7e7
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+在服务器创建 .lock 文件，包含时间戳和超时检查
+****** TODO 实现 release_lock() 函数
+:PROPERTIES:
+:ID: ac0d1744-aaaf-46ec-b099-478c1d1c9e29
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+删除服务器上的 .lock 文件
+****** TODO 实现 is_lock_stale() 函数
+:PROPERTIES:
+:ID: f0c1c565-d967-4551-8bec-92dc53bb2756
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+检查锁文件是否超时（默认30秒），超时则清理
+***** TODO 实现验证功能
+:PROPERTIES:
+:ID: efaafb35-5f8d-4f04-8747-288ea397e849
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+写入后验证节点是否成功添加
+****** TODO 实现 validate_peer_in_config() 函数
+:PROPERTIES:
+:ID: bd0656b5-f965-42ed-be42-06d8795fc042
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+解析配置确认指定公钥的节点存在
+****** TODO 实现 compare_configs() 函数
+:PROPERTIES:
+:ID: 771b4d92-d51c-4313-a152-fecc873b58ca
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+比较两个配置快照，检测已使用IP的变化
+**** TODO 增强解析器模块 (wg_manager/parser.py) :parser:enhancement:
+:PROPERTIES:
+:ID: f292571a-9bb6-4a73-b7db-80eaac59724f
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+扩展解析器以支持IP冲突检测和配置验证
+***** TODO 添加IP提取和验证函数
+:PROPERTIES:
+:ID: e87bec03-c444-42f0-ad99-bb97dfa2eb1b
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+增强IP地址处理能力
+****** TODO 实现 extract_used_ips() 函数
+:PROPERTIES:
+:ID: af405a86-454a-4242-a6bd-4aa85778acdc
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+从配置中提取所有已使用的IP地址列表
+****** TODO 实现 is_ip_available() 函数
+:PROPERTIES:
+:ID: aaadb573-c929-4e37-a8ee-ff8c65303104
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+检查指定IP是否在当前配置中可用
+***** TODO 添加公钥提取函数
+:PROPERTIES:
+:ID: d6390039-6177-49af-bc29-c930f55f4636
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+支持节点验证的公钥处理
+****** TODO 实现 extract_peer_pubkeys() 函数
+:PROPERTIES:
+:ID: 7ac8fff7-77bc-48a1-b869-8df8bcdbd14f
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+从配置中提取所有节点的公钥列表
+**** TODO 增强SSH模块 (wg_manager/ssh.py) :ssh:reliability:
+:PROPERTIES:
+:ID: 4f5e75fe-ca57-4b8c-84c9-61dac3060875
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+添加重试机制和原子操作支持
+***** TODO 实现重试机制
+:PROPERTIES:
+:ID: 49a839be-ebb7-42d2-aac7-6a97a3f262cb
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+为关键操作添加指数退避重试
+****** TODO 创建 retry_decorator 装饰器
+:PROPERTIES:
+:ID: 5b7ffd2c-cd8a-4764-89f2-2e38f8c3975b
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+实现通用重试装饰器，支持指数退避(1s→2s→4s)
+****** TODO 为 read_remote_file() 添加重试逻辑
+:PROPERTIES:
+:ID: a5e5e2a4-5854-436b-91a1-e36e2eacbe0f
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+应用重试装饰器到远程文件读取函数
+****** TODO 为 write_remote_file() 添加重试逻辑
+:PROPERTIES:
+:ID: 4d7a7fda-9baa-45dd-bb92-c791003c9ffd
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+应用重试装饰器到远程文件写入函数
+***** TODO 实现原子写入
+:PROPERTIES:
+:ID: 7e7f5db5-8401-4407-8363-7053ee8ef74e
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+确保配置文件写入的原子性
+****** TODO 实现 atomic_write_remote_file() 函数
+:PROPERTIES:
+:ID: a29c6888-d40f-415f-b576-b470c993b534
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+先写入临时文件再mv，确保原子性
+**** TODO 修改节点添加流程 (wg_manager/add_peer.py) :add_peer:integration:
+:PROPERTIES:
+:ID: a55e76ad-0a65-4097-b57c-ed7e6e798e6c
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+整合同步和锁机制到现有添加流程
+***** TODO 重构 add_peer() 函数结构
+:PROPERTIES:
+:ID: 3fe20ae4-d8d3-4958-aa61-951b92c9641d
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+将添加流程分解为清晰的阶段
+****** TODO 添加 sync 模块导入语句
+:PROPERTIES:
+:ID: 5d1f485b-5950-422e-840e-ea355da19a19
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+在 add_peer.py 顶部导入新的 sync 模块
+****** TODO 提取现有逻辑为 _prepare_peer() 辅助函数
+:PROPERTIES:
+:ID: 7c90febf-b196-458d-884f-4bfd12bb2afb
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+将密钥生成和配置准备逻辑提取为独立函数
+****** TODO 提取现有逻辑为 _write_peer() 辅助函数
+:PROPERTIES:
+:ID: 2c4efde9-1099-405f-96da-d6334aabad2a
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+将配置写入和热加载逻辑提取为独立函数
+***** TODO 集成预添加同步
+:PROPERTIES:
+:ID: 147261ba-e4ba-422f-8e41-5c0f45cab9f6
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+在分配IP之前同步最新配置
+****** TODO 在 allocate_ip 前调用 pull_latest_config()
+:PROPERTIES:
+:ID: 78fa2a74-23f7-4259-ac1c-1741b7ebb7b7
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+获取最新配置快照v1
+****** TODO 添加锁获取逻辑 acquire_lock()
+:PROPERTIES:
+:ID: 74713412-3916-476c-9784-e73376df8b60
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+在IP分配前获取分布式锁
+****** TODO 二次拉取配置并比对变化
+:PROPERTIES:
+:ID: 5b44da13-583f-4110-8172-9921004ca16e
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+获取v2快照，检测v1到v2的IP变化
+***** TODO 集成后添加验证
+:PROPERTIES:
+:ID: e3c38bf9-de11-4d8c-a49a-e4bc065c69ac
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+写入后验证节点已成功添加
+****** TODO 热加载后调用 pull_latest_config() 获取v3
+:PROPERTIES:
+:ID: 59e2a21e-32a1-451d-905e-573cd0dcf240
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+读取写入后的最新配置
+****** TODO 调用 validate_peer_in_config() 验证写入
+:PROPERTIES:
+:ID: 9d602b0b-29be-4f12-831d-56fe25533f13
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+确认新节点公钥存在于配置中
+****** TODO 验证失败时抛出明确错误
+:PROPERTIES:
+:ID: 075106a7-6617-4c07-8ec5-f66cdf27f900
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+添加 RuntimeError 处理验证失败情况
+***** TODO 添加锁释放和异常处理
+:PROPERTIES:
+:ID: a12ecf56-9a50-4d43-a05d-7ec93967cead
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+确保锁在任何情况下都能正确释放
+****** TODO 使用 try/finally 包装主流程
+:PROPERTIES:
+:ID: 2b7a1ed6-9f7d-4b05-9236-869c74c8c420
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+确保 finally 中调用 release_lock()
+****** TODO 添加锁获取失败的重试逻辑
+:PROPERTIES:
+:ID: 46623638-cfd1-43a9-a997-ea8a29cf4a46
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+如果锁被占用，等待并重试(最多3次)
+****** TODO 添加操作超时处理
+:PROPERTIES:
+:ID: ebc921ce-7dab-4dd1-92cd-9e2039fb5a07
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+整体操作超过30秒时报错
+**** TODO 添加错误恢复机制 :recovery:rollback:
+:PROPERTIES:
+:ID: 60ec5278-28e1-4cb8-bd39-cfbe39a49825
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+实现回滚和错误恢复功能
+***** TODO 实现配置备份功能
+:PROPERTIES:
+:ID: f1ae0da8-e303-431f-9ba8-818320403a31
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+修改前备份原始配置
+****** TODO 在 sync.py 中添加 backup_config() 函数
+:PROPERTIES:
+:ID: d7067263-7284-493b-b20d-0fa600299c55
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+写入前将配置复制到 .bak 文件
+****** TODO 在 sync.py 中添加 restore_config() 函数
+:PROPERTIES:
+:ID: 57e1d511-c482-47a2-9a8d-57f83b9fe31d
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+从 .bak 文件恢复原始配置
+***** TODO 实现回滚逻辑
+:PROPERTIES:
+:ID: 8024164f-81fe-467d-857c-9decdd821056
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+热加载失败时自动回滚
+****** TODO 在 add_peer.py 中添加热加载失败回滚
+:PROPERTIES:
+:ID: da180de7-f6f2-4af1-afbd-3214010e7801
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+wg syncconf 失败时调用 restore_config()
+****** TODO 添加回滚操作日志记录
+:PROPERTIES:
+:ID: 5e008a21-3af7-4b95-8bc5-6868faa7cacb
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+记录回滚时间戳和原因供排查
+**** TODO 添加日志和监控 :logging:monitoring:
+:PROPERTIES:
+:ID: 5cc2a8db-ffb7-4ebf-883e-9e82a5188a17
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+增强日志以支持问题排查
+***** TODO 添加同步操作日志
+:PROPERTIES:
+:ID: 7b52f15c-cc67-4fa3-b7f1-e8eb5e835d10
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+记录每次同步操作的详细信息
+****** TODO 在 sync.py 中配置 logger
+:PROPERTIES:
+:ID: 55125eea-634a-499b-a731-4556afafcbc0
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+创建模块级 logger 实例
+****** TODO 添加配置拉取日志
+:PROPERTIES:
+:ID: cf8b7546-bf65-4cff-b0dc-f3ad9ae6b580
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+记录每次拉取的时间、大小、已用IP数
+****** TODO 添加锁操作日志
+:PROPERTIES:
+:ID: 5a62145f-7cc5-4447-8f46-911cdbc27d1a
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+记录锁获取、释放、超时事件
+***** TODO 添加冲突检测日志
+:PROPERTIES:
+:ID: 60c0f2ad-0027-4f43-8fe2-a0bc3b0c8d6c
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+记录配置变化和潜在冲突
+****** TODO 添加配置差异警告日志
+:PROPERTIES:
+:ID: 58246e0d-31ca-48f9-961f-3fa33a43a546
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+v1与v2快照不同时记录warning
+****** TODO 添加验证失败错误日志
+:PROPERTIES:
+:ID: 2f0cd95c-72ca-426d-93ea-630a7bc31995
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+写入验证失败时记录error并包含配置快照
+**** TODO 编写测试用例 :testing:
+:PROPERTIES:
+:ID: 95d6faf8-bad0-4ded-bedc-dc543280a9d1
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+验证同步机制的正确性和边界情况
+***** TODO 编写 sync 模块单元测试
+:PROPERTIES:
+:ID: 9fa58cce-2c7e-4b36-979f-e3af430bd2f0
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+测试同步和锁机制的各函数
+****** TODO 编写 pull_latest_config() 测试
+:PROPERTIES:
+:ID: a7f999b4-0e89-490c-abda-b70bfc40ef16
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+测试正常拉取、空配置、网络错误场景
+****** TODO 编写锁机制测试
+:PROPERTIES:
+:ID: f059ab8f-7ca5-4333-b41e-7ee6be73c885
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+测试获取、释放、超时、过期锁清理
+****** TODO 编写配置验证测试
+:PROPERTIES:
+:ID: 86d80efc-bc08-4a3a-9b4a-2cbf5e11315d
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+测试节点存在检测、格式验证
+***** TODO 编写集成测试
+:PROPERTIES:
+:ID: a38154a0-e02e-4847-96ac-9b7385a3e8b4
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+测试完整的添加节点流程
+****** TODO 编写单节点添加测试
+:PROPERTIES:
+:ID: 068ada27-0814-4b16-a0b4-6d3b2cf419a3
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+验证基础添加流程仍正常工作
+****** TODO 编写并发添加测试
+:PROPERTIES:
+:ID: 7b065d18-4c8e-41fc-845b-376251244ddd
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+使用threading模拟并发添加，验证无IP冲突
+****** TODO 编写网络故障恢复测试
+:PROPERTIES:
+:ID: 59fb3dab-e2ad-4a2f-8617-34de59a9ee82
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+模拟SSH断开后的重试和恢复
+**** TODO 更新文档 :documentation:
+:PROPERTIES:
+:ID: e5a7bc4d-e687-4716-b494-bb62d18182e2
+:CREATED: [2026-01-18 Sat 10:30]
+:DEPENDS_ON: 创建同步模块, 修改节点添加流程
+:END:
+更新README和代码注释以反映新机制
+***** TODO 更新 README.md
+:PROPERTIES:
+:ID: f42e8164-afd5-4cd2-8647-7ea738f15958
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+记录同步机制和并发安全特性
+****** TODO 添加并发安全说明章节
+:PROPERTIES:
+:ID: b1e95517-a299-4324-a3ea-720fb81d6a70
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+说明锁机制和IP冲突预防
+****** TODO 更新使用示例
+:PROPERTIES:
+:ID: 6758fe56-4b76-4711-8dc1-93bd4c455da5
+:CREATED: [2026-01-18 Sat 10:30]
+:END:
+展示并发场景下的正确使用方式
+- Note taken on [2026-01-18 Sun 18:33] (pipeline: 485669) \\
+  claude --permission-mode plan --verbose --dangerously-skip-permissions --output-format stream-json -p "/cc_plan 上级目标: wg-manager / 查看一下当前项目里面添加客户端节点的时候，有没有先跟服务器进行一次同步，还是只依赖本地的数据库？
+  内容: Added: reports/2026/01/10-client-sync-mechanism.md:1
+Modified: None
+Deleted: None
+Files: reports/2026/01/10-client-sync-mechanism.md
+Notes: 研究完成 - 当前项目添加客户端时只依赖本地数据库分配IP，不会先从服务器同步，存在潜在的数据不一致风险
+当前任务: 查看一下当前项目里面添加客户端节点的时候，有没有先跟服务器进行一次同步，还是只依赖本地的数据库？ / 制定一个开发计划。在添加节点之前，从服务器拉取配置再添加新节点，防止有两边同时添加多个节点到服务器上导致 IP 冲突的问题。
+  内容: "
+
