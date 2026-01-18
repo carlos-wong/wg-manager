@@ -4,5 +4,6 @@ __version__ = "0.2.0"
 
 from .deploy import deploy_server
 from .add_peer import add_peer
+from .remove_peer import remove_peer, list_peers
 
-__all__ = ["deploy_server", "add_peer"]
+__all__ = ["deploy_server", "add_peer", "remove_peer", "list_peers"]
