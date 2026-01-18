@@ -4,8 +4,10 @@
 
 ## 功能特性
 
-- **部署服务**: 一键在服务器上部署 WireGuard 服务
+- **部署服务**: 交互式部署 WireGuard 服务，自动检测端口和网段冲突
 - **添加节点**: 添加客户端节点，自动分配 IP，热重载配置（不断线）
+- **删除节点**: 删除客户端节点，支持热移除
+- **列出节点**: 查看所有客户端节点信息
 - **多接口支持**: 同一服务器可配置多个接口（wg0、wg1...）
 - **零本地存储**: 所有配置存储在服务器上，无需本地数据库
 
@@ -34,19 +36,25 @@ uv tool install wg-manager
 在服务器上部署新的 WireGuard 接口：
 
 ```bash
-# 使用默认配置部署 (wg0, 10.0.0.1/24, 端口 51820)
+# 交互式部署（询问接口名、网段、端口）
 wg-manager deploy root@1.2.3.4
 
-# 自定义配置
+# 指定配置（跳过交互询问）
 wg-manager deploy root@1.2.3.4 -a 10.1.0.1/24 -p 51821 -i wg1
+
+# 完全非交互模式（使用默认值）
+wg-manager deploy root@1.2.3.4 --no-interactive
 ```
 
 **流程**：
 1. SSH 连接服务器
-2. 生成服务端密钥对
-3. 创建 `/etc/wireguard/wgX.conf`
-4. 启动服务 `systemctl enable/start wg-quick@wgX`
-5. 输出服务端公钥
+2. 扫描现有接口，显示已使用的网段
+3. 交互询问接口名、网段、端口（自动建议下一个可用值）
+4. 检查端口占用和网段冲突
+5. 生成服务端密钥对
+6. 创建 `/etc/wireguard/wgX.conf`
+7. 启动服务 `systemctl enable/start wg-quick@wgX`
+8. 输出服务端公钥
 
 ### 2. 添加客户端节点
 
@@ -74,6 +82,36 @@ wg-manager add root@1.2.3.4 -n tablet -i wg1
 
 **注意**: 客户端配置只显示一次，请自行保存！
 
+### 3. 删除客户端节点
+
+删除指定的客户端：
+
+```bash
+# 删除客户端
+wg-manager remove root@1.2.3.4 -n phone
+
+# 指定接口
+wg-manager remove root@1.2.3.4 -n phone -i wg1
+```
+
+**流程**：
+1. SSH 连接服务器
+2. 扫描配置文件，定位客户端
+3. 从配置文件中移除 Peer 段
+4. 热移除客户端（`wg set peer remove`）
+
+### 4. 列出所有客户端
+
+查看服务器上的所有客户端：
+
+```bash
+# 列出所有接口的客户端
+wg-manager list root@1.2.3.4
+
+# 只列出指定接口的客户端
+wg-manager list root@1.2.3.4 -i wg0
+```
+
 ## 参数说明
 
 ### deploy 命令
@@ -81,11 +119,12 @@ wg-manager add root@1.2.3.4 -n tablet -i wg1
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | host | 服务器地址 (user@host) | 必填 |
-| -a, --address | 服务端内网地址 | 10.0.0.1/24 |
-| -p, --port | 监听端口 | 51820 |
-| -i, --interface | 接口名称 | wg0 |
+| -a, --address | 服务端内网地址 | 交互询问 |
+| -p, --port | 监听端口 | 交互询问 |
+| -i, --interface | 接口名称 | 交互询问 |
 | --ssh-port | SSH 端口 | 22 |
 | --key-file | SSH 私钥文件路径 | - |
+| --no-interactive | 非交互模式，使用默认值 | - |
 
 ### add 命令
 
@@ -98,6 +137,25 @@ wg-manager add root@1.2.3.4 -n tablet -i wg1
 | --ssh-port | SSH 端口 | 22 |
 | --key-file | SSH 私钥文件路径 | - |
 | --dns | DNS 服务器 | 1.1.1.1 |
+
+### remove 命令
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| host | 服务器地址 (user@host) | 必填 |
+| -n, --name | 客户端名称 | 必填 |
+| -i, --interface | 指定接口名称 | 自动检测 |
+| --ssh-port | SSH 端口 | 22 |
+| --key-file | SSH 私钥文件路径 | - |
+
+### list 命令
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| host | 服务器地址 (user@host) | 必填 |
+| -i, --interface | 指定接口名称 | 显示所有 |
+| --ssh-port | SSH 端口 | 22 |
+| --key-file | SSH 私钥文件路径 | - |
 
 ## 使用示例
 
@@ -133,6 +191,17 @@ wg-manager add root@vpn.example.com -n phone
 
 # 3. 添加笔记本客户端（全局代理）
 wg-manager add root@vpn.example.com -n laptop --allowed-ips "0.0.0.0/0, ::/0"
+
+# 4. 查看所有客户端
+wg-manager list root@vpn.example.com
+
+# 输出:
+# wg0 (10.0.0.1/24):
+#   - phone: 10.0.0.2/32
+#   - laptop: 10.0.0.3/32
+
+# 5. 删除客户端
+wg-manager remove root@vpn.example.com -n phone
 ```
 
 ### 场景二：多网段配置
@@ -183,6 +252,7 @@ wg_manager/
 ├── cli.py           # 命令行接口
 ├── deploy.py        # 部署服务逻辑
 ├── add_peer.py      # 添加节点逻辑
+├── remove_peer.py   # 删除节点逻辑
 ├── ssh.py           # SSH 远程操作
 ├── crypto.py        # 密钥生成
 ├── config.py        # 配置常量
