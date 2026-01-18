@@ -43,6 +43,8 @@ variables:
   NOTIFY_AUTO_MERGE_START: "false"
   NOTIFY_AUTO_MERGE_CONFLICT: "false"
   NOTIFY_AUTO_MERGE_SUCCESS: "false"
+  # Toggle PushDeer notification when AI resolves conflicts (true/false)
+  NOTIFY_CONFLICT_RESOLUTION: "true"
 
 
 # Main job to execute the code agent
@@ -1076,6 +1078,11 @@ execute_worflow_ai_agent:
             else
               echo "emacs agent-insert-plan-json-to-org failed"
             fi
+            # Copy JSON file to repo root for artifact upload with 10-day expiry
+            PLAN_JSON_FILENAME=$(basename "$PLAN_JSON_PATH")
+            PLAN_JSON_ARTIFACT="plan_output_${CI_PIPELINE_ID:-unknown}_${PLAN_JSON_FILENAME}"
+            cp "$PLAN_JSON_PATH" "$REPO_PATH/$PLAN_JSON_ARTIFACT"
+            echo "Copied $PLAN_JSON_PATH to $REPO_PATH/$PLAN_JSON_ARTIFACT for artifact upload"
           else
             echo "Plan JSON not found; checked: cc_plan_output.json, agent_report Files:, .carlos/.codex/plan_exports"
           fi
@@ -1147,8 +1154,9 @@ execute_worflow_ai_agent:
     paths:
       - agent_report.txt
       - ci_result_status.txt
+      - plan_output_*.json
     when: always
-    expire_in: 24 hours
+    expire_in: 10 days
 
 # Sync all branches to Gitea except AI-related branches
 # Filtered out branches: ai/*, complete/*, fail/*, coding/*, todo/*, ai_flow/*
@@ -1763,6 +1771,9 @@ auto_merge_complete_branches:
       fi
       git fetch origin_ssh --prune || echo "Warning: Failed to fetch from origin_ssh"
     - |
+      # Remove untracked artifacts that block branch checkout
+      rm -f context_for_agent.txt task_status.env
+    - |
       # Checkout master or main branch
       if git show-ref --verify --quiet refs/remotes/origin_ssh/master; then
         echo "Checking out master branch"
@@ -1874,6 +1885,18 @@ auto_merge_complete_branches:
         fi
         CLAUDE_COMMAND+="\n注意: 仅解决冲突并保存文件，不要提交 (commit 由 Emacs 处理)"
 
+        # Send PushDeer notification for conflict resolution (controlled by NOTIFY_CONFLICT_RESOLUTION)
+        if [ "${NOTIFY_CONFLICT_RESOLUTION:-true}" = "true" ]; then
+          if [ -n "$PUSHDEER_URL" ] && [ -n "$PUSHDEER_TOKEN" ]; then
+            CONFLICT_NOTIFY_TEXT="🤖 AI 正在解决合并冲突 | 分支: ${CONFLICT_BRANCHES} | Pipeline: ${CI_PIPELINE_URL}"
+            curl -s -o /dev/null -m 10 \
+              -d "text=${CONFLICT_NOTIFY_TEXT}&pushkey=${PUSHDEER_TOKEN}" \
+              -H "Content-type: application/x-www-form-urlencoded" \
+              "$PUSHDEER_URL" || echo "PushDeer notification failed, continuing..."
+            echo "Sent conflict resolution notification"
+          fi
+        fi
+
         CLAUDE_JSON_OUTPUT="/tmp/auto_merge_conflict_${CI_COMMIT_SHA}.json"
         echo "Invoking Claude Code for conflict resolution..."
         set +e
@@ -1888,6 +1911,17 @@ auto_merge_complete_branches:
         echo "Claude output parse exit: $PARSE_EXIT"
         if [ "$CLAUDE_EXIT" -ne 0 ] || [ "$PARSE_EXIT" -ne 0 ]; then
           echo "Claude conflict resolution failed"
+          # Send PushDeer notification for conflict resolution failure
+          if [ "${NOTIFY_CONFLICT_RESOLUTION:-true}" = "true" ]; then
+            if [ -n "$PUSHDEER_URL" ] && [ -n "$PUSHDEER_TOKEN" ]; then
+              CONFLICT_FAIL_TEXT="❌ AI 冲突解决失败 | 分支: ${CONFLICT_BRANCHES} | Pipeline: ${CI_PIPELINE_URL}"
+              curl -s -o /dev/null -m 10 \
+                -d "text=${CONFLICT_FAIL_TEXT}&pushkey=${PUSHDEER_TOKEN}" \
+                -H "Content-type: application/x-www-form-urlencoded" \
+                "$PUSHDEER_URL" || echo "PushDeer notification failed, continuing..."
+              echo "Sent conflict resolution failure notification"
+            fi
+          fi
           exit 2
         fi
 
@@ -1910,9 +1944,65 @@ auto_merge_complete_branches:
         if ! git show-ref --verify --quiet refs/heads/master; then
           TARGET_BRANCH="main"
         fi
+
+        # After conflict resolution, need to integrate with latest remote before push
+        # This handles the case where new commits arrived during conflict resolution
+        echo "Fetching latest from origin_ssh..."
+        git fetch origin_ssh "$TARGET_BRANCH"
+
+        # Try to merge with remote (fast-forward if possible)
+        echo "Merging with latest origin_ssh/$TARGET_BRANCH..."
+        if ! git merge "origin_ssh/$TARGET_BRANCH" --no-edit; then
+          echo "Warning: Merge with remote failed, attempting rebase..."
+          git merge --abort 2>/dev/null || true
+          if ! git rebase "origin_ssh/$TARGET_BRANCH"; then
+            echo "Error: Cannot integrate with remote after conflict resolution"
+            git rebase --abort 2>/dev/null || true
+            send_error_notification "❌ 冲突解决后无法与远端整合，需要人工介入"
+            exit 2
+          fi
+        fi
+
         echo "Pushing resolved merge to origin_ssh/$TARGET_BRANCH"
-        git push origin_ssh "$TARGET_BRANCH"
-        echo "Auto-merge conflict resolved successfully"
+        PUSH_ATTEMPTS=0
+        MAX_PUSH_ATTEMPTS=3
+        while [ "$PUSH_ATTEMPTS" -lt "$MAX_PUSH_ATTEMPTS" ]; do
+          PUSH_ATTEMPTS=$((PUSH_ATTEMPTS + 1))
+          echo "Push attempt $PUSH_ATTEMPTS of $MAX_PUSH_ATTEMPTS..."
+          if git push origin_ssh "$TARGET_BRANCH"; then
+            echo "Auto-merge conflict resolved successfully"
+            # Send PushDeer notification for conflict resolution success
+            if [ "${NOTIFY_CONFLICT_RESOLUTION:-true}" = "true" ]; then
+              if [ -n "$PUSHDEER_URL" ] && [ -n "$PUSHDEER_TOKEN" ]; then
+                CONFLICT_SUCCESS_TEXT="✅ AI 冲突解决成功 | 分支: ${CONFLICT_BRANCHES} -> ${TARGET_BRANCH} | Pipeline: ${CI_PIPELINE_URL}"
+                curl -s -o /dev/null -m 10 \
+                  -d "text=${CONFLICT_SUCCESS_TEXT}&pushkey=${PUSHDEER_TOKEN}" \
+                  -H "Content-type: application/x-www-form-urlencoded" \
+                  "$PUSHDEER_URL" || echo "PushDeer notification failed, continuing..."
+                echo "Sent conflict resolution success notification"
+              fi
+            fi
+            break
+          else
+            if [ "$PUSH_ATTEMPTS" -lt "$MAX_PUSH_ATTEMPTS" ]; then
+              echo "Push failed, fetching and merging latest changes..."
+              git fetch origin_ssh "$TARGET_BRANCH"
+              if ! git merge "origin_ssh/$TARGET_BRANCH" --no-edit; then
+                git merge --abort 2>/dev/null || true
+                if ! git rebase "origin_ssh/$TARGET_BRANCH"; then
+                  echo "Error: Cannot integrate with remote after push failure"
+                  git rebase --abort 2>/dev/null || true
+                  send_error_notification "❌ 推送失败后无法与远端整合，需要人工介入"
+                  exit 2
+                fi
+              fi
+            else
+              echo "Error: Failed to push after $MAX_PUSH_ATTEMPTS attempts"
+              send_error_notification "❌ 推送失败，已尝试 $MAX_PUSH_ATTEMPTS 次，需要人工介入"
+              exit 2
+            fi
+          fi
+        done
       else
         echo "Auto-merge failed with unexpected error (exit code: $EMACS_EXIT)"
         send_error_notification "❌ auto_merge_complete_branches 失败 (exit: $EMACS_EXIT)，请检查日志"
