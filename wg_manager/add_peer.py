@@ -5,8 +5,8 @@ from typing import Optional
 
 from .config import REMOTE_WG_DIR
 from .crypto import generate_keypair, generate_preshared_key
-from .parser import parse_host, parse_config, scan_interfaces, get_network, allocate_ip
-from .ssh import SSHClient, SSHConfig
+from .parser import parse_config, scan_interfaces, get_network, allocate_ip
+from .ssh import connect_ssh
 
 
 def add_peer(
@@ -32,17 +32,8 @@ def add_peer(
     Returns:
         是否成功
     """
-    user, server = parse_host(host)
-
-    # 创建 SSH 客户端
-    ssh_config = SSHConfig(host=server, port=ssh_port, user=user, key_file=key_file)
-    ssh = SSHClient(ssh_config)
-
-    # 测试连接
-    print(f"连接到 {user}@{server}...")
-    success, msg = ssh.test_connection()
-    if not success:
-        print(f"SSH 连接失败: {msg}", file=sys.stderr)
+    ssh, server = connect_ssh(host, ssh_port, key_file)
+    if ssh is None:
         return False
 
     # 扫描配置文件

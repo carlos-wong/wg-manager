@@ -1,8 +1,24 @@
 """SSH 远程管理模块"""
 
+import sys
 import subprocess
 from dataclasses import dataclass
 from typing import Optional
+
+
+def parse_host(host_string: str) -> tuple[str, str]:
+    """解析 user@host 格式的字符串
+
+    Args:
+        host_string: 格式为 user@host 或 host
+
+    Returns:
+        (user, host) 元组
+    """
+    if "@" in host_string:
+        user, host = host_string.split("@", 1)
+        return user, host
+    return "root", host_string
 
 
 @dataclass
@@ -86,3 +102,32 @@ class SSHClient:
             return False, result.stderr.strip()
         except Exception as e:
             return False, str(e)
+
+
+def connect_ssh(
+    host: str,
+    ssh_port: int = 22,
+    key_file: Optional[str] = None
+) -> tuple[Optional[SSHClient], str]:
+    """创建并测试 SSH 连接
+
+    Args:
+        host: 服务器地址 (user@host 格式)
+        ssh_port: SSH 端口
+        key_file: SSH 私钥文件路径
+
+    Returns:
+        (SSHClient, server) 元组，失败时 SSHClient 为 None
+    """
+    user, server = parse_host(host)
+
+    ssh_config = SSHConfig(host=server, port=ssh_port, user=user, key_file=key_file)
+    ssh = SSHClient(ssh_config)
+
+    print(f"连接到 {user}@{server}...")
+    success, msg = ssh.test_connection()
+    if not success:
+        print(f"SSH 连接失败: {msg}", file=sys.stderr)
+        return None, server
+
+    return ssh, server

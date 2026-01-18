@@ -1,24 +1,8 @@
 """WireGuard 配置文件解析器"""
 
 import re
-from typing import Optional
 
 from .ssh import SSHClient
-
-
-def parse_host(host_string: str) -> tuple[str, str]:
-    """解析 user@host 格式的字符串
-
-    Args:
-        host_string: 格式为 user@host 或 host
-
-    Returns:
-        (user, host) 元组
-    """
-    if "@" in host_string:
-        user, host = host_string.split("@", 1)
-        return user, host
-    return "root", host_string
 
 
 def parse_config(content: str) -> tuple[dict, set[int]]:
