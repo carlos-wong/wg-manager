@@ -16,7 +16,7 @@ def add_peer(
     interface: Optional[str] = None,
     ssh_port: int = 22,
     key_file: Optional[str] = None,
-    dns: str = "1.1.1.1"
+    dns: str = ""
 ) -> bool:
     """添加客户端节点
 
@@ -27,7 +27,7 @@ def add_peer(
         interface: 指定接口名称（留空则自动检测/询问）
         ssh_port: SSH 端口，默认 22
         key_file: SSH 私钥文件路径
-        dns: DNS 服务器，默认 1.1.1.1
+        dns: DNS 服务器（留空则不设置）
 
     Returns:
         是否成功
@@ -143,11 +143,11 @@ AllowedIPs = {new_ip.split('/')[0]}/32
     client_address = new_ip.replace('/32', '/24')
 
     # 生成客户端配置
+    dns_line = f"DNS = {dns}\n" if dns else ""
     client_config = f"""[Interface]
 Address = {client_address}
 PrivateKey = {private_key}
-DNS = {dns}
-
+{dns_line}
 [Peer]
 PublicKey = {server_config['public_key']}
 PresharedKey = {psk}

@@ -44,7 +44,7 @@ def main() -> None:
     add_parser.add_argument("-i", "--interface", help="指定接口名称 (多接口时可用)")
     add_parser.add_argument("--ssh-port", type=int, default=22, help="SSH 端口 (默认: 22)")
     add_parser.add_argument("--key-file", help="SSH 私钥文件路径")
-    add_parser.add_argument("--dns", default="1.1.1.1", help="DNS 服务器 (默认: 1.1.1.1)")
+    add_parser.add_argument("--dns", default="", help="DNS 服务器（留空则不设置）")
 
     # remove 命令
     remove_parser = subparsers.add_parser("remove", help="删除客户端节点")
